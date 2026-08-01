@@ -84,6 +84,41 @@ def macd(
     return macd_line, signal_line
 
 
+def atr(candles: list[list], period: int = 14) -> Optional[float]:
+    """
+    Average True Range — mäter hur volatil en token är.
+
+    Används för dynamisk stop loss: en token som normalt rör sig 5% per
+    timme behöver en bredare stop än en som rör sig 0,5%, annars blir du
+    utstoppad av vanligt brus istället för av en riktig vändning.
+
+    candles: ccxt-format [[ts, open, high, low, close, volume], ...]
+    Returnerar ATR i procent av senaste priset.
+    """
+    if len(candles) < period + 1:
+        return None
+
+    true_ranges = []
+    for i in range(1, len(candles)):
+        high = candles[i][2]
+        low = candles[i][3]
+        prev_close = candles[i - 1][4]
+        tr = max(
+            high - low,
+            abs(high - prev_close),
+            abs(low - prev_close),
+        )
+        true_ranges.append(tr)
+
+    recent = true_ranges[-period:]
+    atr_value = sum(recent) / len(recent)
+    last_price = candles[-1][4]
+
+    if last_price <= 0:
+        return None
+    return atr_value / last_price * 100
+
+
 def latest_indicators(candles: list[dict]) -> dict:
     """
     Tar en lista av candle-dicts (från db.get_ohlcv, äldst->nyast) och

@@ -43,6 +43,18 @@ class Settings:
     orderbook_interval: int = int(os.getenv("ORDERBOOK_INTERVAL_SECONDS", "10"))
     trades_interval: int = int(os.getenv("TRADES_INTERVAL_SECONDS", "15"))
     funding_interval: int = int(os.getenv("FUNDING_INTERVAL_SECONDS", "300"))
+    # Hur ofta strategin utvärderas och (ev.) handlar med låtsaspengar
+    strategy_interval: int = int(os.getenv("STRATEGY_INTERVAL_SECONDS", "300"))
+    paper_starting_balance: float = float(os.getenv("PAPER_STARTING_BALANCE", "10000"))
+
+    # Momentum-scanner (jaga tokens som börjar röra sig)
+    momentum_enabled: bool = os.getenv("MOMENTUM_ENABLED", "true").lower() in ("1", "true", "yes")
+    # Hur ofta hela KuCoin skannas efter kandidater (sekunder)
+    scan_interval: int = int(os.getenv("SCAN_INTERVAL_SECONDS", "120"))
+    # Max antal samtidiga momentum-positioner (riskspridning)
+    momentum_max_positions: int = int(os.getenv("MOMENTUM_MAX_POSITIONS", "3"))
+    # Hur stor andel av saldot som satsas per momentum-position
+    momentum_position_size_pct: float = float(os.getenv("MOMENTUM_POSITION_SIZE_PCT", "0.05"))
 
     # Telegram-notiser (se notifier.py för hur du skapar en bot)
     telegram_bot_token: str = os.getenv("TELEGRAM_BOT_TOKEN", "")

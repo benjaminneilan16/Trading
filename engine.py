@@ -20,6 +20,8 @@ import paper_trading
 import scanner
 import momentum_strategy
 import social
+import risk_manager
+import technical
 from notifier import send_notification
 
 logger = logging.getLogger("engine")
@@ -28,8 +30,15 @@ logger = logging.getLogger("engine")
 def run_momentum_scan(exchange, max_positions: int, position_size_pct: float):
     """
     Letar efter tokens som börjar röra sig, och går in i de bästa.
-    Körs mer sällan än exit-kollen (scanning är dyrt i API-anrop).
+    VARJE köp måste godkännas av risk_manager innan det genomförs.
     """
+    # Kill switch stoppar all ny handel — kolla innan vi ens skannar
+    # (scanning kostar API-anrop, ingen mening om vi ändå inte får köpa)
+    state = risk_manager.get_risk_state()
+    if state["kill_switch_active"]:
+        logger.warning("Kill switch aktiv, hoppar över scan: %s", state["kill_switch_reason"])
+        return
+
     open_count = paper_trading.count_open_positions("momentum")
     slots_free = max_positions - open_count
     if slots_free <= 0:
@@ -42,7 +51,6 @@ def run_momentum_scan(exchange, max_positions: int, position_size_pct: float):
         if slots_free <= 0:
             break
 
-        # Gå inte in i något vi redan äger
         if paper_trading.has_open_position(hit["symbol"]):
             paper_trading.log_scanner_hit(hit, entered=False)
             continue
@@ -50,16 +58,42 @@ def run_momentum_scan(exchange, max_positions: int, position_size_pct: float):
         hype = social.hype_score(hit["symbol"])
         enter, reason = momentum_strategy.should_enter(hit, hype)
 
-        paper_trading.log_scanner_hit(hit, entered=enter)
+        if not enter:
+            paper_trading.log_scanner_hit(hit, entered=False)
+            continue
 
-        if enter:
-            paper_trading.buy_momentum(
-                hit["symbol"], hit["last_price"], position_size_pct, reason=reason
-            )
-            send_notification(
-                f"🟢 PAPER KÖP {hit['symbol']} @ {hit['last_price']:.8f}\n{reason}"
-            )
-            slots_free -= 1
+        # --- Grindvakten ---
+        portfolio = paper_trading.get_portfolio()
+        risk_check = risk_manager.check_entry(hit["symbol"], portfolio, position_size_pct)
+
+        if not risk_check["allowed"]:
+            logger.info("Risk Manager stoppade köp av %s: %s", hit["symbol"], risk_check["reason"])
+            paper_trading.log_scanner_hit(hit, entered=False)
+            # Kill switch kan ha aktiverats av risk_check — då är hela scanen slut
+            if "Kill switch" in risk_check["reason"] or "förlustgräns" in risk_check["reason"]:
+                send_notification(f"🛑 HANDEL STOPPAD\n{risk_check['reason']}")
+                return
+            continue
+
+        # Beräkna volatilitetsanpassad stop loss innan entry
+        atr_pct = None
+        try:
+            raw_candles = exchange.fetch_ohlcv(hit["symbol"], timeframe="5m", limit=20)
+            atr_pct = technical.atr(raw_candles)
+        except Exception:
+            pass
+        stop_pct = risk_manager.dynamic_stop_loss_pct(atr_pct, momentum_strategy.STOP_LOSS_PCT)
+
+        paper_trading.buy_momentum(
+            hit["symbol"], hit["last_price"], risk_check["size_pct"],
+            reason=reason, stop_loss_pct=stop_pct,
+        )
+        send_notification(
+            f"🟢 PAPER KÖP {hit['symbol']} @ {hit['last_price']:.8f}\n"
+            f"{reason}\nStop loss: {stop_pct:.1f}%"
+            + (f" (ATR {atr_pct:.1f}%)" if atr_pct else "")
+        )
+        slots_free -= 1
 
 
 def check_momentum_exits(exchange):
@@ -94,7 +128,23 @@ def check_momentum_exits(exchange):
         opened_at = pos["opened_at"]
         held_minutes = (now - opened_at).total_seconds() / 60
 
-        should_exit, reason = momentum_strategy.check_exit(pos, current_price, held_minutes)
+        # --- Nödutgång: rug-pull går före alla vanliga exit-regler ---
+        is_rug, rug_reason = risk_manager.check_rug_pull(
+            exchange, symbol, float(pos["avg_entry_price"])
+        )
+        if is_rug:
+            result = paper_trading.sell(symbol, current_price, reason=rug_reason)
+            if result.get("executed"):
+                send_notification(
+                    f"🚨 NÖDUTGÅNG {symbol} @ {current_price:.8f}\n"
+                    f"{rug_reason}\nResultat: {result.get('realized_pnl', 0):+.2f} USDT"
+                )
+            continue
+
+        should_exit, reason = momentum_strategy.check_exit(
+            pos, current_price, held_minutes,
+            stop_loss_pct=float(pos["stop_loss_pct"]) if pos.get("stop_loss_pct") else None,
+        )
 
         if should_exit:
             result = paper_trading.sell(symbol, current_price, reason=reason)
@@ -104,6 +154,19 @@ def check_momentum_exits(exchange):
                 send_notification(
                     f"{emoji} PAPER SÄLJ {symbol} @ {current_price:.8f}\n"
                     f"{reason}\nResultat: {pnl:+.2f} USDT"
+                )
+            continue
+
+        # Inte full exit — men kanske dags att ta hem halva vinsten?
+        take_partial, partial_reason = momentum_strategy.check_partial_take_profit(
+            pos, current_price
+        )
+        if take_partial:
+            result = paper_trading.sell_partial(symbol, current_price, 0.5, reason=partial_reason)
+            if result.get("executed"):
+                send_notification(
+                    f"💰 DELVINST {symbol} @ {current_price:.8f}\n"
+                    f"{partial_reason}\nSäkrat: {result.get('realized_pnl', 0):+.2f} USDT"
                 )
 
 
@@ -169,6 +232,7 @@ class EngineManager:
             spot = make_spot_exchange()
             futures = make_futures_exchange()
             paper_trading.ensure_wallet_exists(settings.paper_starting_balance)
+            risk_manager.ensure_risk_state()
 
             jobs = [
                 ("ohlcv", settings.ohlcv_interval, collect_ohlcv, spot, settings.symbols),

@@ -19,6 +19,7 @@ Alla endpoints kräver en header:  X-API-Key: <API_KEY från .env>
 Det är den enda "inloggningen" — appen är byggd för en enda användare (dig).
 """
 import logging
+from datetime import datetime
 from typing import Optional
 from fastapi import FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -82,7 +83,7 @@ class SettingsResponse(BaseModel):
 class Candle(BaseModel):
     symbol: str
     timeframe: str
-    ts: str
+    ts: datetime
     open: float
     high: float
     low: float
@@ -92,7 +93,7 @@ class Candle(BaseModel):
 
 class OrderbookSnapshot(BaseModel):
     symbol: str
-    ts: str
+    ts: datetime
     bids: list
     asks: list
     best_bid: Optional[float]
@@ -103,7 +104,7 @@ class OrderbookSnapshot(BaseModel):
 class Trade(BaseModel):
     symbol: str
     trade_id: str
-    ts: str
+    ts: datetime
     side: str
     price: float
     amount: float
@@ -111,14 +112,14 @@ class Trade(BaseModel):
 
 class FundingRate(BaseModel):
     symbol: str
-    ts: str
+    ts: datetime
     funding_rate: float
-    next_funding: Optional[str]
+    next_funding: Optional[datetime]
 
 
 class OpenInterest(BaseModel):
     symbol: str
-    ts: str
+    ts: datetime
     open_interest: float
     open_interest_usd: Optional[float]
 

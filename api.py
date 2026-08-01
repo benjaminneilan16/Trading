@@ -31,6 +31,7 @@ from notifier import send_notification
 import db
 import paper_trading
 import social
+import risk_manager
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger("api")
@@ -396,3 +397,76 @@ def root():
         "docs": "/docs",
         "openapi_spec": "/openapi.json",
     }
+
+
+# ---------------------------------------------------------------------------
+# Risk Manager (Fas 3)
+# ---------------------------------------------------------------------------
+
+class KillSwitchRequest(BaseModel):
+    reason: str = "Manuellt stoppad från appen"
+
+
+@app.get("/api/risk/status", tags=["risk"])
+def risk_status(x_api_key: Optional[str] = Header(default=None)):
+    """
+    Hela riskläget: kill switch, dagens resultat, exponering, och hur
+    mycket utrymme som finns kvar innan varje gräns slår i taket.
+    """
+    check_key(x_api_key)
+    portfolio = paper_trading.get_portfolio()
+    if "error" in portfolio:
+        raise HTTPException(status_code=404, detail=portfolio["error"])
+    return risk_manager.risk_summary(portfolio)
+
+
+@app.get("/api/risk/daily", tags=["risk"])
+def risk_daily(x_api_key: Optional[str] = Header(default=None)):
+    """Dagens statistik: resultat, antal affärer, vinstandel."""
+    check_key(x_api_key)
+    return risk_manager.get_daily_stats()
+
+
+@app.post("/api/risk/kill-switch/activate", tags=["risk"])
+def kill_switch_on(
+    body: KillSwitchRequest,
+    x_api_key: Optional[str] = Header(default=None),
+):
+    """NÖDSTOPP: stoppar all ny handel omedelbart. Öppna positioner ligger kvar."""
+    check_key(x_api_key)
+    risk_manager.activate_kill_switch(body.reason)
+    send_notification(f"🛑 KILL SWITCH AKTIVERAD\n{body.reason}")
+    return {"status": "activated", "reason": body.reason}
+
+
+@app.post("/api/risk/kill-switch/deactivate", tags=["risk"])
+def kill_switch_off(x_api_key: Optional[str] = Header(default=None)):
+    """Släpper på handeln igen efter ett stopp."""
+    check_key(x_api_key)
+    risk_manager.deactivate_kill_switch()
+    send_notification("▶️ Kill switch avaktiverad — handel tillåten igen")
+    return {"status": "deactivated"}
+
+
+@app.post("/api/risk/close-all", tags=["risk"])
+def close_all_positions(x_api_key: Optional[str] = Header(default=None)):
+    """
+    Stänger ALLA öppna positioner till senaste kända pris, och aktiverar
+    kill switch. Det här är den stora röda knappen.
+    """
+    check_key(x_api_key)
+    positions = paper_trading.get_open_positions()
+    closed = []
+
+    for pos in positions:
+        symbol = pos["symbol"]
+        latest = db.get_ohlcv(symbol, "1m", limit=1)
+        price = float(latest[-1]["close"]) if latest else float(pos["avg_entry_price"])
+        result = paper_trading.sell(symbol, price, reason="MANUELL STÄNGNING (close-all)")
+        if result.get("executed"):
+            closed.append({"symbol": symbol, "realized_pnl": result.get("realized_pnl")})
+
+    risk_manager.activate_kill_switch("Alla positioner stängda manuellt")
+    total_pnl = sum(c["realized_pnl"] or 0 for c in closed)
+    send_notification(f"🚨 ALLA POSITIONER STÄNGDA\n{len(closed)} st, resultat {total_pnl:+.2f} USDT")
+    return {"closed": closed, "total_realized_pnl": total_pnl}

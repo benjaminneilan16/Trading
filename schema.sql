@@ -74,3 +74,78 @@ CREATE TABLE IF NOT EXISTS liquidations (
     price       NUMERIC     NOT NULL,
     amount      NUMERIC     NOT NULL
 );
+
+-- ---------------------------------------------------------------------
+-- Paper trading (Fas 2 simulerad + Fas 9) — låtsaspengar, riktiga priser
+-- ---------------------------------------------------------------------
+
+-- En enda rad per "konto". quote_balance = låtsas-USDT du har kvar att handla för.
+CREATE TABLE IF NOT EXISTS paper_wallet (
+    id              INT PRIMARY KEY DEFAULT 1,
+    quote_currency  TEXT    NOT NULL DEFAULT 'USDT',
+    quote_balance   NUMERIC NOT NULL,
+    starting_balance NUMERIC NOT NULL,
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CHECK (id = 1)  -- garanterar bara en rad, det finns bara ett konto
+);
+
+-- Öppna positioner, en rad per symbol du äger just nu i papperskontot
+CREATE TABLE IF NOT EXISTS paper_positions (
+    symbol          TEXT PRIMARY KEY,
+    amount          NUMERIC NOT NULL,       -- hur mycket av basvalutan (t.ex. BTC) du äger
+    avg_entry_price NUMERIC NOT NULL,       -- snittpris du köpte in dig på
+    opened_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Momentum-strategin behöver spåra högsta pris sedan entry (för trailing stop)
+-- och vilken strategi som öppnade positionen.
+ALTER TABLE paper_positions ADD COLUMN IF NOT EXISTS peak_price NUMERIC;
+ALTER TABLE paper_positions ADD COLUMN IF NOT EXISTS strategy TEXT DEFAULT 'technical';
+
+-- Träffar från momentum-scannern, så du kan se vad den hittade även när
+-- den valde att inte gå in.
+CREATE TABLE IF NOT EXISTS scanner_hits (
+    id                  BIGSERIAL PRIMARY KEY,
+    symbol              TEXT        NOT NULL,
+    ts                  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    score               NUMERIC     NOT NULL,
+    volume_ratio        NUMERIC,
+    price_change_15m_pct NUMERIC,
+    quote_volume_24h    NUMERIC,
+    spread_pct          NUMERIC,
+    accelerating        BOOLEAN,
+    entered             BOOLEAN     NOT NULL DEFAULT FALSE,
+    reason              TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_scanner_hits_ts ON scanner_hits (ts DESC);
+
+-- Logg över varje simulerad affär, för att se hur strategin presterat över tid
+CREATE TABLE IF NOT EXISTS paper_trades (
+    id              BIGSERIAL PRIMARY KEY,
+    symbol          TEXT        NOT NULL,
+    side            TEXT        NOT NULL,    -- 'buy' / 'sell'
+    price           NUMERIC     NOT NULL,
+    amount          NUMERIC     NOT NULL,    -- mängd i basvaluta
+    quote_amount    NUMERIC     NOT NULL,    -- mängd i USDT (price * amount)
+    realized_pnl    NUMERIC,                 -- endast ifyllt vid 'sell'
+    reason          TEXT,                    -- t.ex. "EMA-crossover + RSI 28 + MACD bullish"
+    ts              TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_paper_trades_ts ON paper_trades (ts DESC);
+
+-- Logg över VARJE beslut strategin tar (även "avvakta"), så du kan se
+-- resonemanget bakom — bra för att lita på/felsöka den automatiska logiken.
+CREATE TABLE IF NOT EXISTS strategy_signals (
+    id          BIGSERIAL PRIMARY KEY,
+    symbol      TEXT        NOT NULL,
+    ts          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    decision    TEXT        NOT NULL,   -- 'buy' / 'sell' / 'hold'
+    score       NUMERIC     NOT NULL,   -- sammanvägd signalstyrka
+    ema_fast    NUMERIC,
+    ema_slow    NUMERIC,
+    rsi         NUMERIC,
+    macd        NUMERIC,
+    macd_signal NUMERIC,
+    reason      TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_strategy_signals_symbol_ts ON strategy_signals (symbol, ts DESC);

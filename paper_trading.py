@@ -215,10 +215,12 @@ def get_recent_signals(symbol: str = None, limit: int = 20) -> list[dict]:
 # Momentum-strategin — snabba in/ut-positioner
 # ---------------------------------------------------------------------------
 
-def buy_momentum(symbol: str, price: float, size_pct: float, reason: str = "") -> dict:
+def buy_momentum(symbol: str, price: float, size_pct: float, reason: str = "",
+                 stop_loss_pct: float = None) -> dict:
     """
-    Som buy(), men taggar positionen som 'momentum' och sätter peak_price
-    direkt så trailing stop kan börja jobba från första sekunden.
+    Som buy(), men taggar positionen som 'momentum', sätter peak_price
+    direkt så trailing stop kan börja jobba, och sparar en egen
+    volatilitetsanpassad stop loss från Risk Manager.
     """
     with get_cursor() as cur:
         cur.execute("SELECT quote_balance FROM paper_wallet WHERE id = 1 FOR UPDATE")
@@ -237,11 +239,12 @@ def buy_momentum(symbol: str, price: float, size_pct: float, reason: str = "") -
         )
         cur.execute(
             """
-            INSERT INTO paper_positions (symbol, amount, avg_entry_price, peak_price, strategy)
-            VALUES (%s, %s, %s, %s, 'momentum')
+            INSERT INTO paper_positions
+                (symbol, amount, avg_entry_price, peak_price, strategy, stop_loss_pct)
+            VALUES (%s, %s, %s, %s, 'momentum', %s)
             ON CONFLICT (symbol) DO NOTHING
             """,
-            (symbol, amount, price, price),
+            (symbol, amount, price, price, stop_loss_pct),
         )
         cur.execute(
             """
@@ -254,18 +257,60 @@ def buy_momentum(symbol: str, price: float, size_pct: float, reason: str = "") -
     return {"executed": True, "side": "buy", "symbol": symbol, "amount": amount, "price": price}
 
 
+def sell_partial(symbol: str, price: float, fraction: float = 0.5, reason: str = "") -> dict:
+    """
+    Säljer en del av en position (standard: halva) och låter resten ligga.
+    Används för partial take profit — låser in vinst utan att lämna
+    hela uppsidan.
+    """
+    with get_cursor() as cur:
+        cur.execute(
+            "SELECT amount, avg_entry_price FROM paper_positions WHERE symbol = %s FOR UPDATE",
+            (symbol,),
+        )
+        row = cur.fetchone()
+        if row is None:
+            return {"executed": False, "reason": "ingen öppen position"}
+
+        total_amount, avg_entry_price = float(row[0]), float(row[1])
+        sell_amount = total_amount * fraction
+        remaining = total_amount - sell_amount
+
+        proceeds = sell_amount * price
+        realized_pnl = (price - avg_entry_price) * sell_amount
+
+        cur.execute(
+            "UPDATE paper_wallet SET quote_balance = quote_balance + %s, updated_at = now() WHERE id = 1",
+            (proceeds,),
+        )
+        cur.execute(
+            "UPDATE paper_positions SET amount = %s, partial_taken = TRUE WHERE symbol = %s",
+            (remaining, symbol),
+        )
+        cur.execute(
+            """
+            INSERT INTO paper_trades (symbol, side, price, amount, quote_amount, realized_pnl, reason)
+            VALUES (%s, 'sell', %s, %s, %s, %s, %s)
+            """,
+            (symbol, price, sell_amount, proceeds, realized_pnl, reason),
+        )
+    logger.info("PARTIAL SELL %s: %.6f @ %.8f (PnL %.2f) — %s", symbol, sell_amount, price, realized_pnl, reason)
+    return {"executed": True, "side": "sell_partial", "symbol": symbol,
+            "amount": sell_amount, "price": price, "realized_pnl": realized_pnl}
+
+
 def get_open_positions(strategy: str = None) -> list[dict]:
     with get_cursor(commit=False) as cur:
         if strategy:
             cur.execute(
-                "SELECT symbol, amount, avg_entry_price, peak_price, opened_at, strategy "
-                "FROM paper_positions WHERE strategy = %s",
+                "SELECT symbol, amount, avg_entry_price, peak_price, opened_at, strategy, "
+                "stop_loss_pct, partial_taken FROM paper_positions WHERE strategy = %s",
                 (strategy,),
             )
         else:
             cur.execute(
-                "SELECT symbol, amount, avg_entry_price, peak_price, opened_at, strategy "
-                "FROM paper_positions"
+                "SELECT symbol, amount, avg_entry_price, peak_price, opened_at, strategy, "
+                "stop_loss_pct, partial_taken FROM paper_positions"
             )
         cols = [c.name for c in cur.description]
         return [dict(zip(cols, r)) for r in cur.fetchall()]

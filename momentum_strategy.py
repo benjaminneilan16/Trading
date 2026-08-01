@@ -23,6 +23,7 @@ MIN_ENTRY_SCORE = 2.0        # scanner-score som krävs för att gå in
 
 # --- Exit ------------------------------------------------------------------
 TAKE_PROFIT_PCT = 4.0        # ta hem vinst vid +4%
+PARTIAL_TP_PCT = 2.0         # sälj halva vid +2% (låser in vinst tidigt)
 STOP_LOSS_PCT = -2.0         # ut vid -2% (mindre än vinstmålet = positiv risk/reward)
 TRAILING_STOP_PCT = 2.0      # om priset backat 2% från högsta noterade -> ut
 MAX_HOLD_MINUTES = 45        # dör rörelsen ut, ut ändå
@@ -51,15 +52,45 @@ def should_enter(candidate: dict, hype: dict | None = None) -> tuple[bool, str]:
     return True, f"score {score:.1f}: {reason}"
 
 
-def check_exit(position: dict, current_price: float, held_minutes: float) -> tuple[bool, str]:
+def check_partial_take_profit(position: dict, current_price: float) -> tuple[bool, str]:
+    """
+    Säljer halva positionen vid ett tidigt vinstmål.
+
+    Varför: de flesta av dessa rörelser når +2% men bara en del når +4%.
+    Genom att ta hem halva vid +2% blir affären break-even-säkrad, och
+    resten får ligga kvar och jaga den större rörelsen utan stress.
+    Körs bara en gång per position.
+    """
+    if position.get("partial_taken"):
+        return False, ""
+
+    entry = float(position["avg_entry_price"])
+    pnl_pct = (current_price - entry) / entry * 100
+
+    if pnl_pct >= PARTIAL_TP_PCT:
+        return True, f"PARTIAL TP: sålde halva vid +{pnl_pct:.2f}%"
+    return False, ""
+
+
+def check_exit(
+    position: dict,
+    current_price: float,
+    held_minutes: float,
+    stop_loss_pct: float | None = None,
+) -> tuple[bool, str]:
     """
     Kollar alla exit-regler för en öppen position.
+
+    stop_loss_pct: om satt används den istället för standardvärdet.
+    Risk Manager räknar ut ett volatilitetsanpassat värde per token,
+    så att en volatil token inte stoppas ut av vanligt brus.
 
     position behöver: avg_entry_price, peak_price
     Returnerar (ska_sälja, anledning)
     """
     entry = float(position["avg_entry_price"])
     peak = float(position.get("peak_price") or entry)
+    stop = stop_loss_pct if stop_loss_pct is not None else STOP_LOSS_PCT
 
     pnl_pct = (current_price - entry) / entry * 100
 
@@ -67,9 +98,9 @@ def check_exit(position: dict, current_price: float, held_minutes: float) -> tup
     if pnl_pct >= TAKE_PROFIT_PCT:
         return True, f"TAKE PROFIT: +{pnl_pct:.2f}%"
 
-    # 2. Stop loss
-    if pnl_pct <= STOP_LOSS_PCT:
-        return True, f"STOP LOSS: {pnl_pct:.2f}%"
+    # 2. Stop loss (dynamisk om Risk Manager satt en)
+    if pnl_pct <= stop:
+        return True, f"STOP LOSS: {pnl_pct:.2f}% (gräns {stop:.1f}%)"
 
     # 3. Trailing stop — bara aktiv om vi varit i vinst
     if peak > entry:

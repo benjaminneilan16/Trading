@@ -56,6 +56,27 @@ class Settings:
     # Hur stor andel av saldot som satsas per momentum-position
     momentum_position_size_pct: float = float(os.getenv("MOMENTUM_POSITION_SIZE_PCT", "0.05"))
 
+    # --- Risk Manager (Fas 3) ---
+    # Hur mycket kontot får förlora på en dag innan handeln stängs av (%)
+    max_daily_loss_pct: float = float(os.getenv("MAX_DAILY_LOSS_PCT", "5.0"))
+    # Max antal samtidiga öppna positioner totalt (alla strategier)
+    max_open_positions: int = int(os.getenv("MAX_OPEN_POSITIONS", "5"))
+    # Hur stor andel av kontot som får vara i marknaden samtidigt (%)
+    max_total_exposure_pct: float = float(os.getenv("MAX_TOTAL_EXPOSURE_PCT", "40.0"))
+    # Max andel av saldot i EN position (0.10 = 10%)
+    max_position_size_pct: float = float(os.getenv("MAX_POSITION_SIZE_PCT", "0.10"))
+    # Minsta affärsstorlek — under detta äter avgifterna upp vinsten
+    min_trade_size_usdt: float = float(os.getenv("MIN_TRADE_SIZE_USDT", "20"))
+    # Hur länge en token är spärrad efter en förlust (minuter)
+    loss_cooldown_minutes: int = int(os.getenv("LOSS_COOLDOWN_MINUTES", "60"))
+    # Bredaste tillåtna stop loss vid dynamisk beräkning (%)
+    max_stop_loss_pct: float = float(os.getenv("MAX_STOP_LOSS_PCT", "6.0"))
+    # Rug-pull-detektor
+    rug_pull_drop_pct: float = float(os.getenv("RUG_PULL_DROP_PCT", "8.0"))
+    rug_pull_spread_pct: float = float(os.getenv("RUG_PULL_SPREAD_PCT", "3.0"))
+    # Hur ofta öppna positioner kollas för rug-pull-tecken (sekunder)
+    rug_check_interval: int = int(os.getenv("RUG_CHECK_INTERVAL_SECONDS", "60"))
+
     # Telegram-notiser (se notifier.py för hur du skapar en bot)
     telegram_bot_token: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
     telegram_chat_id: str = os.getenv("TELEGRAM_CHAT_ID", "")

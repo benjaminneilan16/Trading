@@ -29,6 +29,8 @@ from config import settings
 from engine import engine
 from notifier import send_notification
 import db
+import paper_trading
+import social
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger("api")
@@ -126,6 +128,51 @@ class OpenInterest(BaseModel):
 
 class NotifyRequest(BaseModel):
     message: str
+
+
+class PaperPosition(BaseModel):
+    symbol: str
+    amount: float
+    avg_entry_price: float
+    opened_at: datetime
+    current_price: float
+    value_usdt: float
+    unrealized_pnl: float
+
+
+class PaperPortfolio(BaseModel):
+    quote_currency: str
+    quote_balance: float
+    starting_balance: float
+    positions: list[PaperPosition]
+    total_value: float
+    total_pnl: float
+    total_pnl_pct: float
+
+
+class PaperTrade(BaseModel):
+    symbol: str
+    side: str
+    price: float
+    amount: float
+    quote_amount: float
+    realized_pnl: Optional[float]
+    reason: Optional[str]
+    ts: datetime
+
+
+class StrategySignal(BaseModel):
+    id: int
+    symbol: str
+    ts: datetime
+    decision: str
+    score: float
+    ema_fast: Optional[float]
+    ema_slow: Optional[float]
+    rsi: Optional[float]
+    macd: Optional[float]
+    macd_signal: Optional[float]
+    reason: Optional[str]
 
 
 # ---------------------------------------------------------------------------
@@ -250,6 +297,89 @@ def notify_custom(body: NotifyRequest, x_api_key: Optional[str] = Header(default
     check_key(x_api_key)
     ok = send_notification(body.message)
     return {"sent": ok}
+
+
+# ---------------------------------------------------------------------------
+# Paper trading — Decision Engine (regelbaserad) + simulerad exekvering
+# ---------------------------------------------------------------------------
+
+@app.get("/api/paper/portfolio", response_model=PaperPortfolio, tags=["paper-trading"])
+def paper_portfolio(x_api_key: Optional[str] = Header(default=None)):
+    check_key(x_api_key)
+    result = paper_trading.get_portfolio()
+    if "error" in result:
+        raise HTTPException(status_code=404, detail=result["error"])
+    return result
+
+
+@app.get("/api/paper/trades", response_model=list[PaperTrade], tags=["paper-trading"])
+def paper_trades(
+    limit: int = Query(50, ge=1, le=500),
+    x_api_key: Optional[str] = Header(default=None),
+):
+    check_key(x_api_key)
+    return paper_trading.get_recent_trades(limit)
+
+
+@app.get("/api/paper/signals", response_model=list[StrategySignal], tags=["paper-trading"])
+def paper_signals(
+    symbol: Optional[str] = Query(None, description="Filtrera på en symbol, t.ex. BTC/USDT"),
+    limit: int = Query(20, ge=1, le=200),
+    x_api_key: Optional[str] = Header(default=None),
+):
+    check_key(x_api_key)
+    return paper_trading.get_recent_signals(symbol, limit)
+
+
+@app.post("/api/paper/reset", tags=["paper-trading"])
+def paper_reset(x_api_key: Optional[str] = Header(default=None)):
+    check_key(x_api_key)
+    paper_trading.reset_wallet(settings.paper_starting_balance)
+    send_notification("♻️ Papperskonto nollställt")
+    return {"status": "reset", "starting_balance": settings.paper_starting_balance}
+
+
+@app.get("/api/scanner/hits", tags=["momentum"])
+def scanner_hits(
+    limit: int = Query(50, ge=1, le=200),
+    x_api_key: Optional[str] = Header(default=None),
+):
+    """Vad momentum-scannern hittat — inklusive kandidater den valde att INTE gå in i."""
+    check_key(x_api_key)
+    return paper_trading.get_scanner_hits(limit)
+
+
+@app.get("/api/momentum/config", tags=["momentum"])
+def momentum_config(x_api_key: Optional[str] = Header(default=None)):
+    """Nuvarande inställningar för momentum-strategin — bra att visa i appen."""
+    check_key(x_api_key)
+    import momentum_strategy as ms
+    import scanner as sc
+    return {
+        "enabled": settings.momentum_enabled,
+        "scan_interval_seconds": settings.scan_interval,
+        "exit_check_interval_seconds": ms.EXIT_CHECK_INTERVAL,
+        "max_positions": settings.momentum_max_positions,
+        "position_size_pct": settings.momentum_position_size_pct,
+        "entry": {
+            "min_score": ms.MIN_ENTRY_SCORE,
+            "volume_spike_min": sc.VOLUME_SPIKE_MIN,
+            "price_change_min_pct": sc.PRICE_CHANGE_MIN_PCT,
+            "price_change_max_pct": sc.PRICE_CHANGE_MAX_PCT,
+        },
+        "exit": {
+            "take_profit_pct": ms.TAKE_PROFIT_PCT,
+            "stop_loss_pct": ms.STOP_LOSS_PCT,
+            "trailing_stop_pct": ms.TRAILING_STOP_PCT,
+            "max_hold_minutes": ms.MAX_HOLD_MINUTES,
+        },
+        "liquidity_filter": {
+            "min_24h_volume_usdt": sc.MIN_24H_QUOTE_VOLUME,
+            "max_24h_volume_usdt": sc.MAX_24H_QUOTE_VOLUME,
+            "max_spread_pct": sc.MAX_SPREAD_PCT,
+        },
+        "social_hype": social.hype_score("BTC/USDT"),
+    }
 
 
 @app.on_event("startup")

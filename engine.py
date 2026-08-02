@@ -22,6 +22,7 @@ import momentum_strategy
 import social
 import risk_manager
 import technical
+import bots as bot_arena
 from notifier import send_notification
 
 logger = logging.getLogger("engine")
@@ -241,6 +242,14 @@ class EngineManager:
                 ("funding_oi", settings.funding_interval, collect_funding_and_oi, futures, settings.futures_symbols),
                 ("strategy", settings.strategy_interval, run_strategy_once, settings.symbols),
             ]
+
+            if settings.bots_enabled:
+                jobs.append((
+                    "bot_arena",
+                    settings.bots_interval,
+                    bot_arena.run_all_bots,
+                    settings.symbols,
+                ))
 
             if settings.momentum_enabled:
                 jobs.append((

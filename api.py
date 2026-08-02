@@ -21,7 +21,7 @@ Det är den enda "inloggningen" — appen är byggd för en enda användare (dig
 import logging
 from datetime import datetime
 from typing import Optional
-from fastapi import FastAPI, Header, HTTPException, Query
+from fastapi import FastAPI, Header, HTTPException, Query, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -572,3 +572,228 @@ def _backtest_verdict(results: list[dict]) -> str:
                 "snarare än en fungerande edge. Testa i en annan tidsperiod.")
     return ("Svagt: förlust på de flesta symboler. Justera trösklarna, eller "
             "acceptera att strategin inte har någon edge i detta marknadsläge.")
+
+
+# ---------------------------------------------------------------------------
+# Strategy Lab — masstestning med skydd mot överanpassning
+# ---------------------------------------------------------------------------
+
+# Labbet tar flera minuter, så det körs i bakgrunden och resultatet
+# hämtas separat. Annars skulle HTTP-anropet timea ut.
+_lab_state = {"status": "idle", "started_at": None, "finished_at": None,
+              "result": None, "error": None}
+
+
+def _run_lab_job(symbols: list[str], timeframe: str, limit: int):
+    import lab
+    from collectors.exchange import make_spot_exchange
+    from datetime import datetime, timezone
+
+    _lab_state.update({
+        "status": "running",
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "finished_at": None, "result": None, "error": None,
+    })
+    try:
+        exchange = make_spot_exchange()
+        result = lab.run_lab(exchange, symbols, timeframe, limit)
+        _lab_state.update({
+            "status": "done",
+            "finished_at": datetime.now(timezone.utc).isoformat(),
+            "result": result,
+        })
+        verdict = result.get("verdict", {}).get("summary", "")
+        send_notification(f"🧪 Strategitest klart\n{verdict}")
+    except Exception as e:
+        logger.exception("Lab-körning misslyckades")
+        _lab_state.update({
+            "status": "error",
+            "finished_at": datetime.now(timezone.utc).isoformat(),
+            "error": str(e),
+        })
+
+
+@app.post("/api/lab/start", tags=["lab"])
+def lab_start(
+    background_tasks: BackgroundTasks,
+    symbols: str = Query("BTC/USDT,ETH/USDT,SOL/USDT", description="Kommaseparerat"),
+    timeframe: str = Query("5m"),
+    limit: int = Query(1000, ge=300, le=1500),
+    x_api_key: Optional[str] = Header(default=None),
+):
+    """
+    Startar en full genomsökning: alla strategier × alla parametrar ×
+    alla symboler, med tränings/testuppdelning.
+
+    Körs i bakgrunden (tar 1-5 minuter). Följ förloppet via /api/lab/status.
+    """
+    check_key(x_api_key)
+    if _lab_state["status"] == "running":
+        raise HTTPException(status_code=409, detail="En körning pågår redan")
+
+    symbol_list = [s.strip() for s in symbols.split(",") if s.strip()][:10]
+    background_tasks.add_task(_run_lab_job, symbol_list, timeframe, limit)
+    return {"status": "started", "symbols": symbol_list, "timeframe": timeframe}
+
+
+@app.get("/api/lab/status", tags=["lab"])
+def lab_status(x_api_key: Optional[str] = Header(default=None)):
+    """Status och (när klart) hela resultatet från senaste labbkörningen."""
+    check_key(x_api_key)
+    return _lab_state
+
+
+@app.get("/api/lab/strategies", tags=["lab"])
+def lab_strategies(x_api_key: Optional[str] = Header(default=None)):
+    """Vilka strategier som finns i biblioteket och hur många kombinationer de ger."""
+    check_key(x_api_key)
+    import strategies as st
+    out = []
+    total = 0
+    for cls in st.ALL_STRATEGIES:
+        combos = st.expand_grid(cls)
+        total += len(combos)
+        out.append({
+            "name": cls.name,
+            "exit_mode": cls.exit_mode,
+            "param_grid": cls.param_grid,
+            "combinations": len(combos),
+        })
+    return {"strategies": out, "total_combinations": total}
+
+
+# ---------------------------------------------------------------------------
+# Social / hype
+# ---------------------------------------------------------------------------
+
+@app.get("/api/social/hype", tags=["social"])
+def social_hype(
+    symbol: str = Query(..., description="T.ex. PEPE/USDT"),
+    x_api_key: Optional[str] = Header(default=None),
+):
+    """
+    Hype-score från Reddit. Mäter FÖRÄNDRING i omnämnanden, inte antal —
+    annars skulle BTC alltid vinna.
+    """
+    check_key(x_api_key)
+    return social.hype_score(symbol)
+
+
+# ---------------------------------------------------------------------------
+# Bot-arena — en bot per strategi, alla tävlar samtidigt
+# ---------------------------------------------------------------------------
+
+class CreateBotRequest(BaseModel):
+    name: str
+    strategy: str
+    params: dict = {}
+    starting_balance: float = 1000.0
+    position_size_pct: float = 0.20
+
+
+@app.get("/api/bots/leaderboard", tags=["bots"])
+def bots_leaderboard(x_api_key: Optional[str] = Header(default=None)):
+    """
+    Topplistan: alla bottar rankade på avkastning, med ärlig kontext om
+    hur mycket siffrorna faktiskt är värda än.
+
+    Läs 'summary.verdict' FÖRST, innan du tittar på placeringarna.
+    """
+    check_key(x_api_key)
+    import bots
+    return bots.leaderboard()
+
+
+@app.get("/api/bots", tags=["bots"])
+def bots_list(x_api_key: Optional[str] = Header(default=None)):
+    check_key(x_api_key)
+    import bots
+    return bots.list_bots()
+
+
+@app.get("/api/bots/{bot_id}", tags=["bots"])
+def bot_detail(bot_id: int, x_api_key: Optional[str] = Header(default=None)):
+    """Full statistik för en enskild bot, inklusive öppna positioner."""
+    check_key(x_api_key)
+    import bots
+    result = bots.bot_stats(bot_id)
+    if "error" in result:
+        raise HTTPException(status_code=404, detail=result["error"])
+    return result
+
+
+@app.get("/api/bots/{bot_id}/trades", tags=["bots"])
+def bot_trades(
+    bot_id: int,
+    limit: int = Query(50, ge=1, le=500),
+    x_api_key: Optional[str] = Header(default=None),
+):
+    check_key(x_api_key)
+    from db import get_cursor
+    with get_cursor(commit=False) as cur:
+        cur.execute(
+            "SELECT symbol, side, price, amount, quote_amount, realized_pnl, "
+            "fees_paid, reason, ts FROM bot_trades WHERE bot_id = %s "
+            "ORDER BY ts DESC LIMIT %s",
+            (bot_id, limit),
+        )
+        cols = [c.name for c in cur.description]
+        return [dict(zip(cols, r)) for r in cur.fetchall()]
+
+
+@app.post("/api/bots/seed", tags=["bots"])
+def bots_seed(x_api_key: Optional[str] = Header(default=None)):
+    """
+    Skapar en bot per strategi i biblioteket, alla med samma startkapital.
+    Befintliga bottar rörs inte. Kör en gång för att starta arenan.
+    """
+    check_key(x_api_key)
+    import bots
+    created = bots.seed_default_bots(settings.bots_starting_balance)
+    send_notification(f"🤖 Bot-arena startad: {len(created)} bottar skapade")
+    return {"created": created, "count": len(created)}
+
+
+@app.post("/api/bots/create", tags=["bots"])
+def bots_create(body: CreateBotRequest, x_api_key: Optional[str] = Header(default=None)):
+    """Skapa en egen bot med valfria parametrar."""
+    check_key(x_api_key)
+    import bots
+    result = bots.create_bot(
+        body.name, body.strategy, body.params,
+        body.starting_balance, body.position_size_pct,
+    )
+    if "error" in result:
+        raise HTTPException(status_code=400, detail=result["error"])
+    return result
+
+
+@app.post("/api/bots/{bot_id}/enable", tags=["bots"])
+def bot_enable(bot_id: int, enabled: bool = Query(True),
+               x_api_key: Optional[str] = Header(default=None)):
+    check_key(x_api_key)
+    import bots
+    bots.set_enabled(bot_id, enabled)
+    return {"id": bot_id, "enabled": enabled}
+
+
+@app.post("/api/bots/{bot_id}/reset", tags=["bots"])
+def bot_reset(bot_id: int, x_api_key: Optional[str] = Header(default=None)):
+    """Nollställer EN bot: saldo tillbaka till start, historik raderas."""
+    check_key(x_api_key)
+    import bots
+    bots.reset_bot(bot_id)
+    return {"id": bot_id, "status": "reset"}
+
+
+@app.post("/api/bots/reset-all", tags=["bots"])
+def bots_reset_all(x_api_key: Optional[str] = Header(default=None)):
+    """
+    Nollställer ALLA bottar. Använd när du vill starta en ny mätperiod,
+    t.ex. efter att ha ändrat strategiparametrar.
+    """
+    check_key(x_api_key)
+    import bots
+    bots.reset_all_bots()
+    send_notification("♻️ Alla bottar nollställda — ny mätperiod startad")
+    return {"status": "all_reset"}

@@ -219,6 +219,19 @@ def check_entry(symbol: str, portfolio: dict, intended_size_pct: float) -> dict:
             "reason": f"{symbol} i cooldown efter nylig förlust",
         }
 
+    # 8. Korrelation — är detta egentligen samma vad som vi redan äger?
+    #    Fem positioner som rör sig likadant är inte riskspridning,
+    #    det är en position med fem gånger storleken.
+    if settings.correlation_filter_enabled:
+        held = [p["symbol"] for p in positions]
+        try:
+            import correlation
+            conflict = correlation.check_correlation_conflict(symbol, held)
+            if conflict["conflict"]:
+                return {"allowed": False, "size_pct": 0, "reason": conflict["reason"]}
+        except Exception as e:
+            logger.debug("Korrelationskoll misslyckades: %s", e)
+
     return {
         "allowed": True,
         "size_pct": size_pct,

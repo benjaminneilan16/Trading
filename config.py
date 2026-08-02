@@ -77,6 +77,17 @@ class Settings:
     # Hur ofta öppna positioner kollas för rug-pull-tecken (sekunder)
     rug_check_interval: int = int(os.getenv("RUG_CHECK_INTERVAL_SECONDS", "60"))
 
+    # --- Social Engine (Fas 6) — Reddit ---
+    # Skapa på reddit.com/prefs/apps -> "script"-typ. Gratis.
+    reddit_client_id: str = os.getenv("REDDIT_CLIENT_ID", "")
+    reddit_client_secret: str = os.getenv("REDDIT_CLIENT_SECRET", "")
+
+    # --- Bot-arena: en bot per strategi, tävlar mot varandra ---
+    bots_enabled: bool = os.getenv("BOTS_ENABLED", "true").lower() in ("1", "true", "yes")
+    # Hur ofta varje bot utvärderar sina signaler (sekunder)
+    bots_interval: int = int(os.getenv("BOTS_INTERVAL_SECONDS", "60"))
+    bots_starting_balance: float = float(os.getenv("BOTS_STARTING_BALANCE", "1000"))
+
     # Telegram-notiser (se notifier.py för hur du skapar en bot)
     telegram_bot_token: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
     telegram_chat_id: str = os.getenv("TELEGRAM_CHAT_ID", "")

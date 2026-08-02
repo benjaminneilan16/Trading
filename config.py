@@ -96,6 +96,12 @@ class Settings:
     # Daglig rapport via Telegram: timme i UTC (8 = 08:00 UTC)
     daily_report_hour_utc: int = int(os.getenv("DAILY_REPORT_HOUR_UTC", "7"))
 
+    # --- Nya listningar ---
+    track_new_listings: bool = os.getenv(
+        "TRACK_NEW_LISTINGS", "true").lower() in ("1", "true", "yes")
+    # Hur ofta symbolregistret synkas (sekunder). Ett API-anrop per körning.
+    listing_sync_interval: int = int(os.getenv("LISTING_SYNC_SECONDS", "600"))
+
     # Telegram-notiser (se notifier.py för hur du skapar en bot)
     telegram_bot_token: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
     telegram_chat_id: str = os.getenv("TELEGRAM_CHAT_ID", "")

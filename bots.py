@@ -32,6 +32,15 @@ logger = logging.getLogger("bots")
 DEFAULT_STARTING_BALANCE = 1000.0
 DEFAULT_POSITION_SIZE_PCT = 0.20  # 20% av botens saldo per affär
 
+# Tak för hur många positioner EN bot får hålla samtidigt.
+#
+# Varför detta behövs: varje bot utvärderar varje bevakad symbol. Med 3
+# symboler är det ofarligt, men med 20 kan en bot öppna 20 positioner och
+# betala avgift på varje. Det gör den till en indexfond med extra steg —
+# och gör jämförelsen mellan bottar meningslös, eftersom en bot som
+# handlar allt alltid liknar marknaden.
+MAX_POSITIONS_PER_BOT = int(__import__("os").getenv("MAX_POSITIONS_PER_BOT", "4"))
+
 
 # ---------------------------------------------------------------------------
 # Skapa och hantera bottar
@@ -280,9 +289,14 @@ def run_all_bots(symbols: list[str], timeframe: str = "1m"):
 
                 if pos is None:
                     if sig == "buy":
+                        # Tak för antal samtidiga positioner
+                        if len(positions) >= MAX_POSITIONS_PER_BOT:
+                            continue
                         # Ladda om saldot — tidigare köp i samma cykel kan ha ändrat det
                         fresh = next((b for b in list_bots() if b["id"] == bot["id"]), bot)
-                        _bot_buy(fresh, symbol, price, f"{strat.describe()} signal")
+                        if _bot_buy(fresh, symbol, price, f"{strat.describe()} signal"):
+                            # Håll räkningen aktuell inom samma cykel
+                            positions[symbol] = {"symbol": symbol}
                 else:
                     # Uppdatera topp för trailing stop
                     peak = max(float(pos["peak_price"] or 0), price)

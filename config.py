@@ -88,6 +88,14 @@ class Settings:
     bots_interval: int = int(os.getenv("BOTS_INTERVAL_SECONDS", "60"))
     bots_starting_balance: float = float(os.getenv("BOTS_STARTING_BALANCE", "1000"))
 
+    # Blockera köp i tillgångar som rör sig likadant som något vi redan äger
+    correlation_filter_enabled: bool = os.getenv(
+        "CORRELATION_FILTER_ENABLED", "true").lower() in ("1", "true", "yes")
+    # Hur ofta kapitalkurvan sparas (sekunder) — ger riktiga equity-grafer
+    equity_snapshot_interval: int = int(os.getenv("EQUITY_SNAPSHOT_SECONDS", "900"))
+    # Daglig rapport via Telegram: timme i UTC (8 = 08:00 UTC)
+    daily_report_hour_utc: int = int(os.getenv("DAILY_REPORT_HOUR_UTC", "7"))
+
     # Telegram-notiser (se notifier.py för hur du skapar en bot)
     telegram_bot_token: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
     telegram_chat_id: str = os.getenv("TELEGRAM_CHAT_ID", "")

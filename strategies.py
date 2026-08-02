@@ -51,9 +51,12 @@ class Strategy:
     name = "base"
     param_grid: dict = {}
     exit_mode = "rules"
+    # True = strategin behöver order flow-data (kan inte backtestas, se lab.py)
+    needs_context = False
 
     def __init__(self, **params):
         self.params = params
+        self.context = None
 
     def prepare(self, candles: list):
         raise NotImplementedError
@@ -298,7 +301,107 @@ class TrendFilteredMomentum(Strategy):
 
 
 # ---------------------------------------------------------------------------
-# 9. Buy & hold — referensstrategin.
+# 9. Order flow — följer vad köpare och säljare faktiskt gör
+#
+#    Detta är en fundamentalt annan sorts signal än de andra. EMA och RSI
+#    räknar på priset, som är RESULTATET av handeln. Order flow tittar på
+#    orsaken: vem som köper, hur mycket, och hur aggressivt.
+#
+#    KAN INTE BACKTESTAS: orderboksdjup och affärsriktning sparas bara
+#    framåt i tiden, inte historiskt. Arenan (forward testing) är därför
+#    enda ärliga sättet att utvärdera den — vilket också gör den till ett
+#    rent test av om order flow slår teknisk analys.
+# ---------------------------------------------------------------------------
+
+class OrderFlowPressure(Strategy):
+    name = "order_flow_pressure"
+    param_grid = {"entry_score": [0.35, 0.5], "exit_score": [-0.2, -0.35]}
+    exit_mode = "signal"
+    needs_context = True
+
+    def prepare(self, candles):
+        self.closes = [c[4] for c in candles]
+
+    def signal(self, i):
+        if not self.context or not self.context.get("available"):
+            return "hold"
+        score = self.context["score"]
+        if score >= self.params["entry_score"]:
+            return "buy"
+        if score <= self.params["exit_score"]:
+            return "sell"
+        return "hold"
+
+
+class WhaleFollow(Strategy):
+    """
+    Handlar bara på stora affärer och absorption — ignorerar allt annat.
+
+    Idén: en affär 8x större än medianen kommer inte från en privatperson.
+    Absorption (hög volym, priset står still) är hur stora aktörer bygger
+    positioner utan att jaga upp priset mot sig själva.
+    """
+    name = "whale_follow"
+    param_grid = {"min_whale_net_ratio": [0.15, 0.30]}
+    exit_mode = "rules"
+    needs_context = True
+
+    def prepare(self, candles):
+        self.closes = [c[4] for c in candles]
+
+    def signal(self, i):
+        if not self.context or not self.context.get("available"):
+            return "hold"
+
+        ctx = self.context
+        total = ctx.get("total_volume") or 0
+        if total <= 0:
+            return "hold"
+
+        whale_ratio = (ctx.get("whale_net_volume") or 0) / total
+
+        # Absorption på köpsidan är den starkaste enskilda signalen
+        if ctx.get("absorption") and ctx.get("absorption_side") == "buy":
+            return "buy"
+
+        if whale_ratio >= self.params["min_whale_net_ratio"] and ctx.get("whale_buys", 0) >= 2:
+            return "buy"
+
+        return "hold"
+
+
+# ---------------------------------------------------------------------------
+# 11. AI Decision Engine — väger samman ALLA signalkällor
+#     Detta är Fas 8: teknisk analys + order flow + social hype + regim,
+#     med vikter satta efter hur pålitlig varje källa är i princip.
+# ---------------------------------------------------------------------------
+
+class EnsembleDecision(Strategy):
+    name = "ensemble_ai"
+    param_grid = {}
+    exit_mode = "signal"
+    needs_context = True
+
+    def prepare(self, candles):
+        self.candles = candles
+
+    def signal(self, i):
+        if not self.context:
+            return "hold"
+        import decision_engine
+        result = decision_engine.decide(
+            self.context.get("symbol", ""),
+            self.candles,
+            flow=self.context.get("flow"),
+            hype=self.context.get("hype"),
+            regime_data=self.context.get("regime"),
+        )
+        self.last_decision = result
+        return result["decision"]
+
+
+# ---------------------------------------------------------------------------
+# 12. Buy & hold — referensstrategin.
 #    Slår en strategi inte denna är den inte värd sin komplexitet.
 # ---------------------------------------------------------------------------
 
@@ -323,6 +426,9 @@ ALL_STRATEGIES = [
     DonchianBreakout,
     VolumeSpikeMomentum,
     TrendFilteredMomentum,
+    OrderFlowPressure,
+    WhaleFollow,
+    EnsembleDecision,
     BuyAndHold,
 ]
 

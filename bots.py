@@ -24,6 +24,7 @@ from datetime import datetime, timezone
 from db import get_cursor, get_ohlcv
 import strategies
 import momentum_strategy
+import orderflow
 from backtest import FEE_PCT, SLIPPAGE_PCT
 
 logger = logging.getLogger("bots")
@@ -219,6 +220,34 @@ def run_all_bots(symbols: list[str], timeframe: str = "1m"):
         logger.info("Ingen candle-data tillgänglig än för bottarna")
         return
 
+    # Order flow räknas ut EN gång per symbol och delas av alla bottar
+    # som behöver den. Annars skulle varje bot göra samma tunga
+    # databasfrågor om och om igen.
+    needs_flow = any(
+        strategies.STRATEGY_MAP.get(b["strategy"]) is not None
+        and strategies.STRATEGY_MAP[b["strategy"]].needs_context
+        for b in bots
+    )
+    flow_cache = {}
+    regime_cache = {}
+    hype_cache = {}
+    if needs_flow:
+        import regime as regime_mod
+        import social
+        for sym, candles in candle_cache.items():
+            try:
+                flow_cache[sym] = orderflow.get_flow_metrics(sym, window_minutes=15)
+            except Exception as e:
+                logger.error("Order flow misslyckades för %s: %s", sym, e)
+            try:
+                regime_cache[sym] = regime_mod.detect_regime(candles)
+            except Exception as e:
+                logger.error("Regimdetektering misslyckades för %s: %s", sym, e)
+            try:
+                hype_cache[sym] = social.hype_score(sym)
+            except Exception as e:
+                logger.debug("Hype-hämtning misslyckades för %s: %s", sym, e)
+
     now = datetime.now(timezone.utc)
 
     for bot in bots:
@@ -232,6 +261,16 @@ def run_all_bots(symbols: list[str], timeframe: str = "1m"):
         for symbol, candles in candle_cache.items():
             try:
                 strat = cls(**params)
+                if cls.needs_context:
+                    if cls.name == "ensemble_ai":
+                        strat.context = {
+                            "symbol": symbol,
+                            "flow": flow_cache.get(symbol),
+                            "regime": regime_cache.get(symbol),
+                            "hype": hype_cache.get(symbol),
+                        }
+                    else:
+                        strat.context = flow_cache.get(symbol)
                 strat.prepare(candles)
                 i = len(candles) - 1
                 sig = strat.signal(i)

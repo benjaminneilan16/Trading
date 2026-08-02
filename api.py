@@ -797,3 +797,141 @@ def bots_reset_all(x_api_key: Optional[str] = Header(default=None)):
     bots.reset_all_bots()
     send_notification("♻️ Alla bottar nollställda — ny mätperiod startad")
     return {"status": "all_reset"}
+
+
+# ---------------------------------------------------------------------------
+# Order flow — vad köpare och säljare faktiskt gör
+# ---------------------------------------------------------------------------
+
+@app.get("/api/orderflow", tags=["orderflow"])
+def get_orderflow(
+    symbol: str = Query(..., description="T.ex. BTC/USDT"),
+    window_minutes: int = Query(15, ge=1, le=120),
+    x_api_key: Optional[str] = Header(default=None),
+):
+    """
+    Order flow-analys från din egen insamlade data.
+
+    Läser `trades` och `orderbook_snapshots` och räknar ut:
+    CVD (aggressiva köp minus säljningar), orderboksobalans, valprintar
+    (affärer 8x medianen), absorption (hög volym men priset står still),
+    och en sammanvägd score mellan -1 och +1.
+    """
+    check_key(x_api_key)
+    import orderflow
+    return orderflow.get_flow_metrics(symbol, window_minutes)
+
+
+@app.get("/api/orderflow/all", tags=["orderflow"])
+def get_orderflow_all(
+    window_minutes: int = Query(15, ge=1, le=120),
+    x_api_key: Optional[str] = Header(default=None),
+):
+    """Order flow för alla bevakade symboler, sorterat på score."""
+    check_key(x_api_key)
+    import orderflow
+    data = orderflow.get_flow_for_symbols(settings.symbols, window_minutes)
+    available = [v for v in data.values() if v.get("available")]
+    available.sort(key=lambda x: x["score"], reverse=True)
+    return {
+        "symbols": data,
+        "ranked": available,
+        "strongest_buy_pressure": available[0]["symbol"] if available else None,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Regim, korrelation, equity, beslutsmotor
+# ---------------------------------------------------------------------------
+
+@app.get("/api/regime", tags=["analysis"])
+def get_regime(x_api_key: Optional[str] = Header(default=None)):
+    """
+    Vilken sorts marknad är det just nu — trendande eller sidledes?
+
+    Detta förklarar VARFÖR vissa bottar leder. Trendföljare tjänar pengar
+    när priset rör sig rakt; mean reversion när det svänger sidledes.
+    Fältet 'favors' visar vilka strategier som brukar passa regimen.
+    """
+    check_key(x_api_key)
+    import regime
+    return regime.regime_for_symbols(settings.symbols)
+
+
+@app.get("/api/correlation", tags=["analysis"])
+def get_correlation(x_api_key: Optional[str] = Header(default=None)):
+    """
+    Korrelation mellan bevakade symboler.
+
+    Par över 0,75 rör sig i praktiken likadant — att hålla flera av dem
+    samtidigt är inte riskspridning utan en större position i samma sak.
+    """
+    check_key(x_api_key)
+    import correlation
+    return correlation.correlation_matrix(settings.symbols)
+
+
+@app.get("/api/decision", tags=["analysis"])
+def get_decision(
+    symbol: str = Query(..., description="T.ex. BTC/USDT"),
+    x_api_key: Optional[str] = Header(default=None),
+):
+    """
+    AI Decision Engine (Fas 8): väger samman teknisk analys, order flow,
+    social hype och marknadsregim till ett beslut — med full uppdelning
+    av hur varje källa bidrog.
+    """
+    check_key(x_api_key)
+    import decision_engine, orderflow, regime, social
+    from db import get_ohlcv
+
+    rows = get_ohlcv(symbol, "5m", limit=150)
+    if len(rows) < 60:
+        raise HTTPException(status_code=400, detail="För lite candle-data för denna symbol")
+
+    candles = [
+        [int(r["ts"].timestamp() * 1000), float(r["open"]), float(r["high"]),
+         float(r["low"]), float(r["close"]), float(r["volume"])]
+        for r in rows
+    ]
+
+    return decision_engine.decide(
+        symbol,
+        candles,
+        flow=orderflow.get_flow_metrics(symbol),
+        hype=social.hype_score(symbol),
+        regime_data=regime.detect_regime(candles),
+    )
+
+
+@app.get("/api/bots/{bot_id}/equity", tags=["bots"])
+def bot_equity(
+    bot_id: int,
+    hours: int = Query(168, ge=1, le=8760),
+    x_api_key: Optional[str] = Header(default=None),
+):
+    """Kapitalkurva för en bot — riktiga värden, inklusive orealiserade positioner."""
+    check_key(x_api_key)
+    import reporting
+    return {
+        "curve": reporting.get_equity_curve(bot_id, hours),
+        "drawdown": reporting.true_drawdown(bot_id),
+    }
+
+
+@app.get("/api/report/daily", tags=["analysis"])
+def daily_report(x_api_key: Optional[str] = Header(default=None)):
+    """Dygnsrapporten som text — samma som skickas till Telegram varje morgon."""
+    check_key(x_api_key)
+    import reporting
+    return {"report": reporting.build_daily_report()}
+
+
+@app.post("/api/report/send", tags=["analysis"])
+def send_report_now(x_api_key: Optional[str] = Header(default=None)):
+    """Skicka dygnsrapporten till Telegram direkt, utan att vänta på schemat."""
+    check_key(x_api_key)
+    import reporting
+    report = reporting.build_daily_report()
+    ok = send_notification(report)
+    return {"sent": ok, "report": report}

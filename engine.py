@@ -23,6 +23,7 @@ import social
 import risk_manager
 import technical
 import bots as bot_arena
+import reporting
 from notifier import send_notification
 
 logger = logging.getLogger("engine")
@@ -249,6 +250,18 @@ class EngineManager:
                     settings.bots_interval,
                     bot_arena.run_all_bots,
                     settings.symbols,
+                ))
+
+            if settings.bots_enabled:
+                jobs.append((
+                    "equity_snapshots",
+                    settings.equity_snapshot_interval,
+                    reporting.snapshot_all_bots,
+                ))
+                jobs.append((
+                    "daily_report",
+                    600,  # kollar var 10:e minut, skickar en gång per dygn
+                    reporting.maybe_send_daily_report,
                 ))
 
             if settings.momentum_enabled:

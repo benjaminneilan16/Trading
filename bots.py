@@ -41,6 +41,26 @@ DEFAULT_POSITION_SIZE_PCT = 0.20  # 20% av botens saldo per affär
 # handlar allt alltid liknar marknaden.
 MAX_POSITIONS_PER_BOT = int(__import__("os").getenv("MAX_POSITIONS_PER_BOT", "4"))
 
+# --- Säkerhetsnät som gäller ALLA bottar, oavsett strategi ---
+#
+# Varför detta behövs: strategier med exit_mode "signal" säljer bara när
+# strategin ger säljsignal. Kommer den aldrig rider positionen ner hur
+# långt som helst. En RSI-bot som köper vid 25 och token faller 70% sitter
+# kvar för alltid.
+#
+# Utan detta mäter arenan inte vilken strategi som är bäst, utan vilken
+# som hade turen att slippa en katastrof.
+#
+# Nivåerna är medvetet vida — de ska fånga haverier, inte ersätta
+# strategiernas egna exits.
+HARD_STOP_LOSS_PCT = float(__import__("os").getenv("BOT_HARD_STOP_PCT", "-15.0"))
+MAX_HOLD_HOURS = float(__import__("os").getenv("BOT_MAX_HOLD_HOURS", "72"))
+
+# Handla inte på data som är äldre än så här (minuter). Slutar
+# insamlingen fungera fryser sista candlen, och utan denna koll skulle
+# bottarna fortsätta handla på ett pris som inte finns längre.
+MAX_CANDLE_AGE_MINUTES = float(__import__("os").getenv("MAX_CANDLE_AGE_MINUTES", "15"))
+
 
 # ---------------------------------------------------------------------------
 # Skapa och hantera bottar
@@ -213,17 +233,46 @@ def run_all_bots(symbols: list[str], timeframe: str = "1m"):
     if not bots:
         return
 
+    # Kill switch gäller ALLA bottar, inte bara momentum-scannern.
+    # Befintliga positioner får ligga kvar och stängas av sina vanliga
+    # regler — men inga nya köp.
+    try:
+        import risk_manager
+        risk_state = risk_manager.get_risk_state()
+        kill_switch_on = risk_state["kill_switch_active"]
+        if kill_switch_on:
+            logger.warning("Kill switch aktiv — bottarna gör inga nya köp")
+    except Exception as e:
+        logger.error("Kunde inte läsa riskläge: %s", e)
+        kill_switch_on = False
+
     # Hämta data en gång
     candle_cache = {}
+    stale_symbols = []
+    now_check = datetime.now(timezone.utc)
+
     for sym in symbols:
         rows = get_ohlcv(sym, timeframe, limit=200)
-        if len(rows) >= 60:
-            # Gör om till ccxt-format som strategierna förväntar sig
-            candle_cache[sym] = [
-                [int(r["ts"].timestamp() * 1000), float(r["open"]), float(r["high"]),
-                 float(r["low"]), float(r["close"]), float(r["volume"])]
-                for r in rows
-            ]
+        if len(rows) < 60:
+            continue
+
+        # Färskhetskoll — handla inte på frusen data
+        age_minutes = (now_check - rows[-1]["ts"]).total_seconds() / 60
+        if age_minutes > MAX_CANDLE_AGE_MINUTES:
+            stale_symbols.append((sym, round(age_minutes, 1)))
+            continue
+
+        candle_cache[sym] = [
+            [int(r["ts"].timestamp() * 1000), float(r["open"]), float(r["high"]),
+             float(r["low"]), float(r["close"]), float(r["volume"])]
+            for r in rows
+        ]
+
+    if stale_symbols:
+        logger.warning(
+            "Hoppar över inaktuell data: %s",
+            ", ".join(f"{s} ({a} min gammal)" for s, a in stale_symbols),
+        )
 
     if not candle_cache:
         logger.info("Ingen candle-data tillgänglig än för bottarna")
@@ -289,6 +338,9 @@ def run_all_bots(symbols: list[str], timeframe: str = "1m"):
 
                 if pos is None:
                     if sig == "buy":
+                        # Kill switch: inga nya köp
+                        if kill_switch_on:
+                            continue
                         # Tak för antal samtidiga positioner
                         if len(positions) >= MAX_POSITIONS_PER_BOT:
                             continue
@@ -306,16 +358,33 @@ def run_all_bots(symbols: list[str], timeframe: str = "1m"):
                             (peak, pos["id"]),
                         )
 
+                    entry = float(pos["entry_price"])
+                    pnl_pct = (price - entry) / entry * 100
+                    held_hours = (now - pos["opened_at"]).total_seconds() / 3600
+
                     exit_now, reason = False, ""
-                    if cls.exit_mode == "signal":
-                        if sig == "sell":
-                            exit_now, reason = True, "SELL-signal"
-                    else:
-                        held_min = (now - pos["opened_at"]).total_seconds() / 60
-                        exit_now, reason = momentum_strategy.check_exit(
-                            {"avg_entry_price": float(pos["entry_price"]), "peak_price": peak},
-                            price, held_min,
-                        )
+
+                    # --- Säkerhetsnätet går FÖRE strategins egen logik ---
+                    # Gäller alla bottar utom buy_and_hold, som per
+                    # definition ska hålla oavsett vad som händer.
+                    if bot["strategy"] != "buy_and_hold":
+                        if pnl_pct <= HARD_STOP_LOSS_PCT:
+                            exit_now = True
+                            reason = f"SÄKERHETSSTOPP: {pnl_pct:.1f}% (gräns {HARD_STOP_LOSS_PCT}%)"
+                        elif held_hours >= MAX_HOLD_HOURS:
+                            exit_now = True
+                            reason = f"MAXTID: {held_hours:.0f}h ({pnl_pct:+.1f}%)"
+
+                    if not exit_now:
+                        if cls.exit_mode == "signal":
+                            if sig == "sell":
+                                exit_now, reason = True, "SELL-signal"
+                        else:
+                            held_min = held_hours * 60
+                            exit_now, reason = momentum_strategy.check_exit(
+                                {"avg_entry_price": entry, "peak_price": peak},
+                                price, held_min,
+                            )
 
                     if exit_now:
                         fresh = next((b for b in list_bots() if b["id"] == bot["id"]), bot)

@@ -148,10 +148,13 @@ def analyze_candidate(exchange, symbol: str) -> dict | None:
     }
 
 
-def scan(exchange, min_score: float = 2.0) -> list[dict]:
+def scan(exchange, min_score: float = 2.0, prefer_new: bool = True) -> list[dict]:
     """
-    Full scan: steg 1 + steg 2. Returnerar kandidater sorterade på score,
-    bara de som passerar min_score.
+    Full scan: steg 1 + steg 2. Returnerar kandidater sorterade på score.
+
+    prefer_new: unga tokens får bonuspoäng. Ungdom är ingen köpsignal i
+    sig — bara en förstärkning av en signal som redan finns. En ny token
+    utan volymspik är fortfarande ointressant.
     """
     stage1 = scan_stage1(exchange)
     results = []
@@ -162,6 +165,23 @@ def scan(exchange, min_score: float = 2.0) -> list[dict]:
             continue
         analysis["quote_volume_24h"] = c["quote_volume_24h"]
         analysis["spread_pct"] = c["spread_pct"]
+
+        if prefer_new:
+            try:
+                import newlistings
+                bonus, note = newlistings.newness_bonus(c["symbol"])
+                if bonus > 0:
+                    # Nya tokens har bredare spreadar — kräv bättre likviditet
+                    if c["spread_pct"] > newlistings.MAX_NEW_TOKEN_SPREAD_PCT:
+                        analysis["reason"] += f", {note} men spread {c['spread_pct']:.2f}% för bred"
+                    else:
+                        analysis["score"] += bonus
+                        analysis["reason"] += f", {note}"
+                        analysis["is_new_token"] = True
+                        analysis["age_days"] = newlistings.get_age(c["symbol"])
+            except Exception as e:
+                logger.debug("Nyhetsbonus misslyckades för %s: %s", c["symbol"], e)
+
         results.append(analysis)
 
     results.sort(key=lambda r: r["score"], reverse=True)

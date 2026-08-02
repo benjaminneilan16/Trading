@@ -24,9 +24,29 @@ import risk_manager
 import technical
 import bots as bot_arena
 import reporting
+import newlistings
 from notifier import send_notification
 
 logger = logging.getLogger("engine")
+
+
+def sync_new_listings(exchange):
+    """
+    Håller symbolregistret aktuellt och larmar vid genuint nya listningar.
+    Ett API-anrop per körning.
+    """
+    result = newlistings.sync_registry(exchange)
+    if result.get("error"):
+        return
+
+    new = result.get("new_symbols", [])
+    if new:
+        # Bara larma om de faktiskt har någon likviditet — annars kommer
+        # notiser om varje obskyr token som listas.
+        send_notification(
+            f"🆕 NY LISTNING på KuCoin\n" + "\n".join(new[:5])
+            + (f"\n(+{len(new)-5} till)" if len(new) > 5 else "")
+        )
 
 
 def run_momentum_scan(exchange, max_positions: int, position_size_pct: float):
@@ -262,6 +282,20 @@ class EngineManager:
                     "daily_report",
                     600,  # kollar var 10:e minut, skickar en gång per dygn
                     reporting.maybe_send_daily_report,
+                ))
+
+            if settings.track_new_listings:
+                jobs.append((
+                    "listing_sync",
+                    settings.listing_sync_interval,
+                    sync_new_listings,
+                    spot,
+                ))
+                jobs.append((
+                    "age_checks",
+                    120,
+                    newlistings.check_pending_ages,
+                    spot,
                 ))
 
             if settings.momentum_enabled:

@@ -470,3 +470,105 @@ def close_all_positions(x_api_key: Optional[str] = Header(default=None)):
     total_pnl = sum(c["realized_pnl"] or 0 for c in closed)
     send_notification(f"🚨 ALLA POSITIONER STÄNGDA\n{len(closed)} st, resultat {total_pnl:+.2f} USDT")
     return {"closed": closed, "total_realized_pnl": total_pnl}
+
+
+# ---------------------------------------------------------------------------
+# Backtesting (Fas 5)
+# ---------------------------------------------------------------------------
+
+@app.get("/api/backtest/run", tags=["backtest"])
+def run_backtest(
+    symbol: str = Query(..., description="T.ex. BTC/USDT"),
+    strategy_name: str = Query("momentum", description="'momentum' eller 'technical'"),
+    timeframe: str = Query("5m", description="1m, 5m, 15m, 1h"),
+    limit: int = Query(1000, ge=100, le=1500, description="Antal candles bakåt"),
+    starting_balance: float = Query(1000.0, gt=0),
+    x_api_key: Optional[str] = Header(default=None),
+):
+    """
+    Kör strategin mot historisk data och returnerar nyckeltal.
+
+    Tar 5-20 sekunder beroende på antal candles. Avgifter (0,1%/sida) och
+    slippage (0,15%/sida) är inräknade — resultatet är alltså vad du
+    ungefär hade fått, inte ett teoretiskt bästa fall.
+    """
+    check_key(x_api_key)
+    import backtest
+    from collectors.exchange import make_spot_exchange
+
+    exchange = make_spot_exchange()
+    result = backtest.run(
+        exchange, symbol, strategy_name, timeframe, limit, starting_balance
+    )
+    if "error" in result:
+        raise HTTPException(status_code=400, detail=result["error"])
+    return result
+
+
+@app.get("/api/backtest/compare", tags=["backtest"])
+def compare_backtest(
+    symbols: str = Query(..., description="Kommaseparerat, t.ex. BTC/USDT,ETH/USDT,SOL/USDT"),
+    strategy_name: str = Query("momentum"),
+    timeframe: str = Query("5m"),
+    limit: int = Query(500, ge=100, le=1000),
+    x_api_key: Optional[str] = Header(default=None),
+):
+    """
+    Kör samma strategi på flera symboler och jämför.
+
+    Detta är den viktigaste vyn: en strategi som bara fungerar på EN token
+    är oftast överanpassad (tur), inte en fungerande strategi.
+    """
+    check_key(x_api_key)
+    import backtest
+    from collectors.exchange import make_spot_exchange
+
+    exchange = make_spot_exchange()
+    symbol_list = [s.strip() for s in symbols.split(",") if s.strip()][:10]
+
+    results = []
+    for sym in symbol_list:
+        try:
+            r = backtest.run(exchange, sym, strategy_name, timeframe, limit)
+            if "error" not in r:
+                results.append(r["metrics"])
+        except Exception as e:
+            logger.error("Backtest misslyckades för %s: %s", sym, e)
+
+    if not results:
+        raise HTTPException(status_code=400, detail="Ingen backtest kunde köras")
+
+    profitable = [r for r in results if r["total_return_pct"] > 0]
+    beat_hold = [r for r in results if r.get("beat_buy_and_hold")]
+
+    return {
+        "results": results,
+        "summary": {
+            "symbols_tested": len(results),
+            "profitable": len(profitable),
+            "beat_buy_and_hold": len(beat_hold),
+            "avg_return_pct": round(sum(r["total_return_pct"] for r in results) / len(results), 2),
+            "total_trades": sum(r["trades"] for r in results),
+            "verdict": _backtest_verdict(results),
+        },
+    }
+
+
+def _backtest_verdict(results: list[dict]) -> str:
+    """En ärlig sammanfattning istället för bara siffror."""
+    total_trades = sum(r["trades"] for r in results)
+    if total_trades < 20:
+        return ("För få affärer för att dra slutsatser. Kör längre period "
+                "eller fler symboler — under ~30 affärer är resultatet mest slump.")
+
+    profitable = len([r for r in results if r["total_return_pct"] > 0])
+    ratio = profitable / len(results)
+
+    if ratio >= 0.7:
+        return ("Lovande: lönsam på de flesta symboler. Det tyder på att det "
+                "inte bara är tur på en enskild token. Kör vidare på papper.")
+    if ratio >= 0.4:
+        return ("Blandat: lönsam på ungefär hälften. Kan vara marknadsberoende "
+                "snarare än en fungerande edge. Testa i en annan tidsperiod.")
+    return ("Svagt: förlust på de flesta symboler. Justera trösklarna, eller "
+            "acceptera att strategin inte har någon edge i detta marknadsläge.")

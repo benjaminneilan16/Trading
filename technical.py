@@ -119,6 +119,57 @@ def atr(candles: list[list], period: int = 14) -> Optional[float]:
     return atr_value / last_price * 100
 
 
+def vwap(candles: list[list], period: int = 20) -> list[float | None]:
+    """
+    Volume Weighted Average Price — snittpriset viktat med volym.
+
+    Skiljer sig från vanliga glidande medelvärden på ett viktigt sätt:
+    en bar med stor volym påverkar VWAP mycket mer än en tunn bar. Det
+    gör den till en bättre bild av var handeln FAKTISKT skett, vilket är
+    varför institutionella traders använder den som riktmärke.
+
+    candles: ccxt-format [[ts, o, h, l, c, v], ...]
+    """
+    out: list[float | None] = []
+    for i in range(len(candles)):
+        if i < period - 1:
+            out.append(None)
+            continue
+        window = candles[i - period + 1 : i + 1]
+        pv_sum = 0.0
+        v_sum = 0.0
+        for c in window:
+            typical = (c[2] + c[3] + c[4]) / 3  # (high + low + close) / 3
+            pv_sum += typical * c[5]
+            v_sum += c[5]
+        out.append(pv_sum / v_sum if v_sum > 0 else None)
+    return out
+
+
+def efficiency_ratio(closes: list[float], period: int = 20) -> float | None:
+    """
+    Kaufmans Efficiency Ratio — mäter hur "rak" en prisrörelse är.
+
+    Räknas som (nettorörelse) / (summan av alla enskilda rörelser).
+
+    Nära 1,0 = priset gick rakt från A till B (stark trend)
+    Nära 0,0 = priset rörde sig mycket men kom ingenstans (sidledes/brus)
+
+    Detta är kärnan i regimdetekteringen: trendföljande strategier behöver
+    hög ER för att fungera, mean reversion-strategier fungerar bäst vid låg.
+    """
+    if len(closes) < period + 1:
+        return None
+
+    window = closes[-(period + 1):]
+    net_move = abs(window[-1] - window[0])
+    total_move = sum(abs(window[i] - window[i - 1]) for i in range(1, len(window)))
+
+    if total_move == 0:
+        return 0.0
+    return net_move / total_move
+
+
 def latest_indicators(candles: list[dict]) -> dict:
     """
     Tar en lista av candle-dicts (från db.get_ohlcv, äldst->nyast) och

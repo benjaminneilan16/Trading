@@ -935,3 +935,116 @@ def send_report_now(x_api_key: Optional[str] = Header(default=None)):
     report = reporting.build_daily_report()
     ok = send_notification(report)
     return {"sent": ok, "report": report}
+
+
+# ---------------------------------------------------------------------------
+# Nya listningar
+# ---------------------------------------------------------------------------
+
+@app.get("/api/listings/new", tags=["listings"])
+def new_listings(
+    max_age_days: int = Query(30, ge=1, le=180),
+    x_api_key: Optional[str] = Header(default=None),
+):
+    """
+    Tokens under angiven ålder, sorterat på ålder (yngst först).
+
+    Åldern mäts genom att räkna dagliga candles — KuCoin säger inte när
+    ett par listades, men candles finns bara från listningsdagen.
+    """
+    check_key(x_api_key)
+    import newlistings
+    tokens = newlistings.get_new_tokens(max_age_days)
+    return {
+        "tokens": tokens,
+        "count": len(tokens),
+        "warning": (
+            "Nya listningar är den mest riskfyllda kategorin. Listningspumpar "
+            "vänder ofta hårt, spreadarna är bredare och likviditeten tunnare. "
+            "Det är också här pump-and-dump är vanligast."
+        ),
+    }
+
+
+@app.get("/api/listings/stats", tags=["listings"])
+def listing_stats(x_api_key: Optional[str] = Header(default=None)):
+    """Status för symbolregistret: hur många som är kända och åldersbestämda."""
+    check_key(x_api_key)
+    import newlistings
+    return newlistings.registry_stats()
+
+
+@app.post("/api/listings/sync", tags=["listings"])
+def sync_listings(x_api_key: Optional[str] = Header(default=None)):
+    """Synka symbolregistret direkt istället för att vänta på schemat."""
+    check_key(x_api_key)
+    import newlistings
+    from collectors.exchange import make_spot_exchange
+    return newlistings.sync_registry(make_spot_exchange())
+
+
+@app.post("/api/listings/check-ages", tags=["listings"])
+def check_ages(x_api_key: Optional[str] = Header(default=None)):
+    """
+    Åldersbestäm nästa omgång okontrollerade symboler.
+
+    Kör detta några gånger efter första uppsättningen — varje anrop
+    kontrollerar 15 symboler, och registret innehåller hundratals.
+    """
+    check_key(x_api_key)
+    import newlistings
+    from collectors.exchange import make_spot_exchange
+    checked = newlistings.check_pending_ages(make_spot_exchange())
+    stats = newlistings.registry_stats()
+    return {"checked_now": checked, **stats}
+
+
+@app.get("/api/health", tags=["meta"])
+def health_check(x_api_key: Optional[str] = Header(default=None)):
+    """
+    Är systemet friskt? Kollar att datainsamlingen faktiskt levererar
+    färsk data — utan detta kan bottarna handla på frusna priser i
+    timmar utan att någon märker det.
+    """
+    check_key(x_api_key)
+    from datetime import datetime, timezone
+    from db import get_cursor
+
+    now = datetime.now(timezone.utc)
+    checks = []
+
+    with get_cursor(commit=False) as cur:
+        for sym in settings.symbols:
+            cur.execute(
+                "SELECT MAX(ts) FROM ohlcv WHERE symbol = %s AND timeframe = '1m'",
+                (sym,),
+            )
+            row = cur.fetchone()
+            latest = row[0] if row else None
+            age_min = (now - latest).total_seconds() / 60 if latest else None
+            checks.append({
+                "symbol": sym,
+                "latest_candle": latest,
+                "age_minutes": round(age_min, 1) if age_min is not None else None,
+                "fresh": age_min is not None and age_min <= 15,
+            })
+
+        cur.execute("SELECT MAX(ts) FROM trades")
+        latest_trade = cur.fetchone()[0]
+        cur.execute("SELECT MAX(ts) FROM orderbook_snapshots")
+        latest_book = cur.fetchone()[0]
+
+    stale = [c["symbol"] for c in checks if not c["fresh"]]
+
+    return {
+        "engine_running": engine.running,
+        "ohlcv": checks,
+        "latest_trade": latest_trade,
+        "latest_orderbook": latest_book,
+        "stale_symbols": stale,
+        "healthy": engine.running and not stale,
+        "note": (
+            f"{len(stale)} symboler har inaktuell data — bottarna hoppar över dem "
+            "tills insamlingen kommit ikapp."
+        ) if stale else "All data är färsk.",
+    }

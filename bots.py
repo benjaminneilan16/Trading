@@ -221,7 +221,88 @@ def _get_positions(bot_id: int) -> list[dict]:
         return [dict(zip(cols, r)) for r in cur.fetchall()]
 
 
-def run_all_bots(symbols: list[str], timeframe: str = "1m"):
+# ---------------------------------------------------------------------------
+# Dynamisk bevakningslista — låter bottarna jaga småtokens
+# ---------------------------------------------------------------------------
+
+# Hur många dynamiska kandidater som tas in per cykel utöver de fasta
+MAX_DYNAMIC_SYMBOLS = int(__import__("os").getenv("MAX_DYNAMIC_SYMBOLS", "15"))
+DYNAMIC_WATCHLIST_ENABLED = __import__("os").getenv(
+    "DYNAMIC_WATCHLIST_ENABLED", "true").lower() in ("1", "true", "yes")
+# Hur länge kandidatlistan återanvänds (sekunder). Att bygga den kostar
+# ett API-anrop per symbol, så vi gör det inte varje botcykel.
+WATCHLIST_TTL_SECONDS = 300
+
+_watchlist_cache = {"built_at": 0.0, "candles": {}, "tickers": {}}
+
+
+def build_dynamic_watchlist(exchange) -> tuple[dict, dict]:
+    """
+    Bygger en lista över småtokens som rör sig just nu, och hämtar candles
+    för dem. Returnerar (candles_per_symbol, alla_tickers).
+
+    Urvalet är medvetet enklare än momentum-scannerns: vi vill ge bottarna
+    ett RIMLIGT urval att välja bland, inte förhandsvälja åt dem. Skulle vi
+    filtrera hårt här mätte vi scannerns urval istället för strategierna.
+    """
+    import time
+    now = time.time()
+
+    if now - _watchlist_cache["built_at"] < WATCHLIST_TTL_SECONDS and _watchlist_cache["candles"]:
+        return _watchlist_cache["candles"], _watchlist_cache["tickers"]
+
+    try:
+        tickers = exchange.fetch_tickers()
+    except Exception as e:
+        logger.error("Kunde inte hämta tickers för bevakningslistan: %s", e)
+        return _watchlist_cache["candles"], _watchlist_cache["tickers"]
+
+    import scanner as sc
+
+    candidates = []
+    for symbol, t in tickers.items():
+        if not symbol.endswith("/USDT"):
+            continue
+        qv = t.get("quoteVolume")
+        bid, ask = t.get("bid"), t.get("ask")
+        if not qv or not bid or not ask or bid <= 0:
+            continue
+        if not (sc.MIN_24H_QUOTE_VOLUME <= qv <= sc.MAX_24H_QUOTE_VOLUME):
+            continue
+        spread_pct = (ask - bid) / bid * 100
+        if spread_pct > sc.MAX_SPREAD_PCT:
+            continue
+
+        # Rankning: dagsrörelse, med bonus för unga tokens
+        score = abs(t.get("percentage") or 0)
+        try:
+            import newlistings
+            bonus, _ = newlistings.newness_bonus(symbol)
+            score += bonus * 5  # ungdom väger tungt i URVALET, inte i beslutet
+        except Exception:
+            pass
+
+        candidates.append((symbol, score))
+
+    candidates.sort(key=lambda c: c[1], reverse=True)
+    chosen = [c[0] for c in candidates[:MAX_DYNAMIC_SYMBOLS]]
+
+    candles = {}
+    for sym in chosen:
+        try:
+            raw = exchange.fetch_ohlcv(sym, timeframe="1m", limit=200)
+            if len(raw) >= 60:
+                candles[sym] = raw
+        except Exception as e:
+            logger.debug("Kunde inte hämta candles för %s: %s", sym, e)
+
+    _watchlist_cache.update({"built_at": now, "candles": candles, "tickers": tickers})
+    logger.info("Dynamisk bevakningslista: %d symboler (%s)",
+                len(candles), ", ".join(list(candles)[:5]))
+    return candles, tickers
+
+
+def run_all_bots(symbols: list[str], timeframe: str = "1m", exchange=None):
     """
     Kör en cykel för alla aktiva bottar.
 
@@ -274,6 +355,49 @@ def run_all_bots(symbols: list[str], timeframe: str = "1m"):
             ", ".join(f"{s} ({a} min gammal)" for s, a in stale_symbols),
         )
 
+    # --- Dynamiska kandidater: småtokens som rör sig just nu ---
+    # De fasta symbolerna kommer från databasen (redan insamlade).
+    # De dynamiska hämtas direkt från börsen, eftersom vi inte samlar in
+    # data för hundratals par.
+    fixed_symbols = set(candle_cache.keys())
+    all_tickers = {}
+
+    if exchange is not None and DYNAMIC_WATCHLIST_ENABLED:
+        try:
+            dynamic_candles, all_tickers = build_dynamic_watchlist(exchange)
+            for sym, raw in dynamic_candles.items():
+                if sym not in candle_cache:
+                    candle_cache[sym] = raw
+        except Exception as e:
+            logger.error("Dynamisk bevakningslista misslyckades: %s", e)
+
+    # --- Priser för ÖPPNA positioner som inte finns i listan ---
+    #
+    # Kritiskt: en bot som köpt en småtoken måste kunna sälja den även när
+    # token åkt ur kandidatlistan. Utan detta fastnar positioner för alltid
+    # och säkerhetsnätet kan aldrig lösa ut.
+    orphan_prices = {}
+    with get_cursor(commit=False) as cur:
+        cur.execute("SELECT DISTINCT symbol FROM bot_positions")
+        held_symbols = {r[0] for r in cur.fetchall()}
+
+    orphans = held_symbols - set(candle_cache.keys())
+    for sym in orphans:
+        price = None
+        if all_tickers.get(sym, {}).get("last"):
+            price = all_tickers[sym]["last"]
+        elif exchange is not None:
+            try:
+                price = exchange.fetch_ticker(sym).get("last")
+            except Exception as e:
+                logger.error("Kunde inte hämta pris för öppen position %s: %s", sym, e)
+        if price:
+            orphan_prices[sym] = float(price)
+
+    if orphans:
+        logger.info("Öppna positioner utanför bevakningslistan: %s",
+                    ", ".join(sorted(orphans)))
+
     if not candle_cache:
         logger.info("Ingen candle-data tillgänglig än för bottarna")
         return
@@ -316,7 +440,43 @@ def run_all_bots(symbols: list[str], timeframe: str = "1m"):
         params = bot["params"] if isinstance(bot["params"], dict) else json.loads(bot["params"])
         positions = {p["symbol"]: p for p in _get_positions(bot["id"])}
 
+        # --- Först: stäng positioner utanför bevakningslistan om reglerna säger det ---
+        # Dessa kan inte utvärderas av strategin (ingen candle-data), men
+        # säkerhetsnätet måste ändå gälla.
+        for sym, pos in list(positions.items()):
+            if sym in candle_cache or sym not in orphan_prices:
+                continue
+            price = orphan_prices[sym]
+            entry = float(pos["entry_price"])
+            pnl_pct = (price - entry) / entry * 100
+            held_hours = (now - pos["opened_at"]).total_seconds() / 3600
+            peak = max(float(pos["peak_price"] or 0), price)
+
+            with get_cursor() as cur:
+                cur.execute("UPDATE bot_positions SET peak_price = %s WHERE id = %s",
+                            (peak, pos["id"]))
+
+            exit_now, reason = False, ""
+            if bot["strategy"] != "buy_and_hold":
+                if pnl_pct <= HARD_STOP_LOSS_PCT:
+                    exit_now, reason = True, f"SÄKERHETSSTOPP: {pnl_pct:.1f}%"
+                elif held_hours >= MAX_HOLD_HOURS:
+                    exit_now, reason = True, f"MAXTID: {held_hours:.0f}h ({pnl_pct:+.1f}%)"
+                else:
+                    exit_now, reason = momentum_strategy.check_exit(
+                        {"avg_entry_price": entry, "peak_price": peak}, price, held_hours * 60,
+                    )
+            if exit_now:
+                fresh = next((b for b in list_bots() if b["id"] == bot["id"]), bot)
+                _bot_sell(fresh, pos, price, reason + " [utanför bevakningslistan]")
+                positions.pop(sym, None)
+
         for symbol, candles in candle_cache.items():
+            # Referensboten ska ligga i de STORA paren, annars mäter den
+            # inte "vad hade hänt om jag bara köpt och väntat" utan
+            # "vad hade hänt om jag köpt slumpmässiga småtokens".
+            if bot["strategy"] == "buy_and_hold" and symbol not in fixed_symbols:
+                continue
             try:
                 strat = cls(**params)
                 if cls.needs_context:

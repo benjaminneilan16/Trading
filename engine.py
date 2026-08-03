@@ -270,6 +270,8 @@ class EngineManager:
                     settings.bots_interval,
                     bot_arena.run_all_bots,
                     settings.symbols,
+                    "1m",
+                    spot,
                 ))
 
             if settings.bots_enabled:

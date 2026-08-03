@@ -414,7 +414,14 @@ class BuyAndHold(Strategy):
         self.n = len(candles)
 
     def signal(self, i):
-        return "buy" if i == 30 else "hold"
+        # Alltid "buy": den som anropar köper bara om ingen position finns,
+        # och eftersom vi aldrig returnerar "sell" hålls den för alltid.
+        #
+        # Tidigare stod här `i == 30`, vilket fungerade i backtesten (som
+        # loopar igenom varje bar) men ALDRIG i bot-arenan (som bara tittar
+        # på senaste baren, index ~199). Referensboten köpte alltså aldrig
+        # något, och hela jämförelsegrunden var trasig.
+        return "buy"
 
 
 ALL_STRATEGIES = [

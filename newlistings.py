@@ -94,7 +94,8 @@ def sync_registry(exchange) -> dict:
     ensure_registry()
 
     try:
-        tickers = exchange.fetch_tickers()
+        from collectors.exchange import fetch_all_tickers
+        tickers = fetch_all_tickers(exchange)
     except Exception as e:
         logger.error("Kunde inte hämta tickers: %s", e)
         return {"error": str(e)}

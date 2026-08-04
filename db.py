@@ -209,3 +209,44 @@ def get_latest_open_interest(symbol: str) -> dict | None:
         )
         rows = _rows_to_dicts(cur)
     return rows[0] if rows else None
+
+
+def get_ohlcv_resampled(symbol: str, minutes: int = 5, limit: int = 200) -> list[dict]:
+    """
+    Bygger candles med längre tidsupplösning från 1-minutersdatan.
+
+    VARFÖR: bot-arenan utvärderade strategier på 1-minuterscandles varje
+    minut. Strategier som EMA-crossover och Bollinger är byggda för timmar
+    och dagar — på minutnivå pendlar signalen kring tröskeln och triggar
+    köp och sälj om vartannat (whipsaw). Resultatet blev 2 694 affärer på
+    två dygn och 1 181 USDT i avgifter.
+
+    Aggregering istället för ny insamling gör att hela historiken finns
+    tillgänglig direkt, utan att vänta på att data samlas in på nytt.
+    """
+    with get_cursor(commit=False) as cur:
+        cur.execute(
+            """
+            SELECT
+                date_bin(%s::interval, ts, TIMESTAMPTZ '2000-01-01') AS bucket,
+                (array_agg(open  ORDER BY ts ASC))[1]  AS open,
+                MAX(high) AS high,
+                MIN(low)  AS low,
+                (array_agg(close ORDER BY ts DESC))[1] AS close,
+                SUM(volume) AS volume
+            FROM ohlcv
+            WHERE symbol = %s AND timeframe = '1m'
+            GROUP BY bucket
+            ORDER BY bucket DESC
+            LIMIT %s
+            """,
+            (f"{minutes} minutes", symbol, limit),
+        )
+        rows = cur.fetchall()
+
+    out = [
+        {"ts": r[0], "open": r[1], "high": r[2], "low": r[3],
+         "close": r[4], "volume": r[5]}
+        for r in rows
+    ]
+    return list(reversed(out))  # äldst -> nyast

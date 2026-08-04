@@ -5,7 +5,13 @@ from db import insert_orderbook_snapshot
 
 logger = logging.getLogger(__name__)
 
-DEPTH = 20  # antal nivåer per sida vi sparar
+# Antal nivåer per sida vi SPARAR i databasen.
+#
+# Sänkt från 20 till 8: orderboksdata var det som fyllde databasen till
+# 95%. Order flow-analysen summerar bara djupet för att räkna obalans,
+# och de översta nivåerna står för det mesta av den informationen —
+# nivå 15-20 påverkar knappt resultatet men kostar lika mycket plats.
+DEPTH = 8
 
 
 def collect_orderbook(exchange, symbols: list[str]):

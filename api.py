@@ -1193,3 +1193,36 @@ def db_emergency(x_api_key: Optional[str] = Header(default=None)):
     result = cleanup.emergency_truncate_orderbook()
     send_notification(f"🧹 Nödtömning: {result['freed_mb']} MB frigjort")
     return result
+
+
+@app.get("/api/bots/analysis", tags=["bots"])
+def bots_analysis(x_api_key: Optional[str] = Header(default=None)):
+    """
+    Djupanalys av alla bottar — skiljer strategifel från friktionsfel.
+
+    Det avgörande måttet är BRUTTO mot NETTO: hur mycket priset rörde sig
+    mellan köp och sälj, jämfört med vad boten fick behålla.
+
+      Brutto positivt, netto negativt -> strategin har kant men handlar
+                                          för ofta. Justerbart.
+      Brutto negativt                 -> strategin gissar fel. Dött spår.
+
+    I topplistan ser båda fallen likadana ut. Här syns skillnaden.
+    """
+    check_key(x_api_key)
+    import analysis
+    return analysis.analyze_all()
+
+
+@app.get("/api/bots/{bot_id}/analysis", tags=["bots"])
+def bot_analysis_single(bot_id: int, x_api_key: Optional[str] = Header(default=None)):
+    """Samma analys för en enskild bot."""
+    check_key(x_api_key)
+    import analysis
+    from db import get_cursor
+    with get_cursor(commit=False) as cur:
+        cur.execute("SELECT id, name, strategy FROM bots WHERE id = %s", (bot_id,))
+        row = cur.fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Bot finns inte")
+    return analysis.analyze_bot(row[0], row[1], row[2])

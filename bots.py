@@ -62,6 +62,67 @@ MAX_HOLD_HOURS = float(__import__("os").getenv("BOT_MAX_HOLD_HOURS", "72"))
 # bottarna fortsätta handla på ett pris som inte finns längre.
 MAX_CANDLE_AGE_MINUTES = float(__import__("os").getenv("MAX_CANDLE_AGE_MINUTES", "15"))
 
+# ---------------------------------------------------------------------------
+# Tidsskala för arenan
+#
+# Bakgrund: den första mätperioden gav 2 694 affärer på två dygn och
+# 1 181 USDT i avgifter. Median-hålltiden var 10-22 minuter på flera
+# bottar, och 62% av macd_cross affärer varade under 15 minuter.
+#
+# Orsaken var att vi utvärderade strategier byggda för timmar och dagar
+# på 1-minuterscandles, varje minut. Signalen pendlar då kring tröskeln
+# och triggar köp och sälj om vartannat.
+#
+# Lika illa: whale_follow stängdes av TIME EXIT i 210 fall av 210. Inte
+# en enda position fick utvecklas färdigt. Vi mätte inte strategierna —
+# vi mätte vår egen tidsgräns.
+# ---------------------------------------------------------------------------
+
+# Vilken candle-upplösning strategierna ser
+ARENA_TIMEFRAME_MINUTES = int(__import__("os").getenv("ARENA_TIMEFRAME_MINUTES", "5"))
+
+# Ingen exit (utom stop loss) före denna tid
+ARENA_MIN_HOLD_MINUTES = float(__import__("os").getenv("ARENA_MIN_HOLD_MINUTES", "30"))
+
+# Regelbaserade exits: hur länge en position får utvecklas.
+# Höjd från 45 minuter till 12 timmar — ett Donchian-utbrott är byggt för
+# att spela ut över dagar, inte under en lunchrast.
+ARENA_MAX_HOLD_MINUTES = float(__import__("os").getenv("ARENA_MAX_HOLD_MINUTES", "720"))
+
+# Vinstmål och trailing stop för arenans regelbaserade exits.
+# Vidare än momentum-scannerns, eftersom vi nu jagar större rörelser.
+ARENA_TAKE_PROFIT_PCT = float(__import__("os").getenv("ARENA_TAKE_PROFIT_PCT", "6.0"))
+ARENA_TRAILING_STOP_PCT = float(__import__("os").getenv("ARENA_TRAILING_STOP_PCT", "3.0"))
+
+# Hur många cykler i rad samma signal måste synas innan den agerar på.
+# Filtrerar bort signaler som bara nuddar tröskeln och studsar tillbaka.
+SIGNAL_CONFIRMATIONS = int(__import__("os").getenv("SIGNAL_CONFIRMATIONS", "2"))
+
+# Minne av föregående signaler: {(bot_id, symbol): [signal, signal, ...]}
+_signal_history: dict = {}
+
+
+def _confirmed_signal(bot_id: int, symbol: str, signal: str) -> str:
+    """
+    Returnerar signalen bara om den upprepats tillräckligt många cykler.
+    Annars "hold".
+
+    Utan detta agerar boten på varje litet hopp över tröskeln. Med två
+    bekräftelser krävs att signalen håller i sig — vilket sållar bort
+    en stor del av brusaffärerna.
+    """
+    key = (bot_id, symbol)
+    history = _signal_history.get(key, [])
+    history.append(signal)
+    history = history[-SIGNAL_CONFIRMATIONS:]
+    _signal_history[key] = history
+
+    if len(history) < SIGNAL_CONFIRMATIONS:
+        return "hold"
+    if all(s == signal for s in history):
+        return signal
+    return "hold"
+
 
 # ---------------------------------------------------------------------------
 # Skapa och hantera bottar
@@ -310,7 +371,8 @@ def build_dynamic_watchlist(exchange) -> tuple[dict, dict]:
     candles = {}
     for sym in chosen:
         try:
-            raw = exchange.fetch_ohlcv(sym, timeframe="1m", limit=200)
+            raw = exchange.fetch_ohlcv(
+                sym, timeframe=f"{ARENA_TIMEFRAME_MINUTES}m", limit=200)
             if len(raw) >= 60:
                 candles[sym] = raw
         except Exception as e:
@@ -411,14 +473,16 @@ def run_all_bots(symbols: list[str], timeframe: str = "1m", exchange=None):
     stale_symbols = []
     now_check = datetime.now(timezone.utc)
 
+    from db import get_ohlcv_resampled
     for sym in symbols:
-        rows = get_ohlcv(sym, timeframe, limit=200)
+        rows = get_ohlcv_resampled(sym, ARENA_TIMEFRAME_MINUTES, limit=200)
         if len(rows) < 60:
             continue
 
         # Färskhetskoll — handla inte på frusen data
         age_minutes = (now_check - rows[-1]["ts"]).total_seconds() / 60
-        if age_minutes > MAX_CANDLE_AGE_MINUTES:
+        # En 5-minuterscandle är per definition upp till 5 min "gammal"
+        if age_minutes > MAX_CANDLE_AGE_MINUTES + ARENA_TIMEFRAME_MINUTES:
             stale_symbols.append((sym, round(age_minutes, 1)))
             continue
 
@@ -554,7 +618,12 @@ def _run_bot_cycle(bots, candle_cache, fixed_symbols, orphan_prices, now,
                     exit_now, reason = True, f"MAXTID: {held_hours:.0f}h ({pnl_pct:+.1f}%)"
                 else:
                     exit_now, reason = momentum_strategy.check_exit(
-                        {"avg_entry_price": entry, "peak_price": peak}, price, held_hours * 60,
+                        {"avg_entry_price": entry, "peak_price": peak},
+                        price, held_hours * 60,
+                        take_profit_pct=ARENA_TAKE_PROFIT_PCT,
+                        trailing_stop_pct=ARENA_TRAILING_STOP_PCT,
+                        max_hold_minutes=ARENA_MAX_HOLD_MINUTES,
+                        min_hold_minutes=ARENA_MIN_HOLD_MINUTES,
                     )
             if exit_now:
                 fresh = next((b for b in list_bots() if b["id"] == bot["id"]), bot)
@@ -581,7 +650,9 @@ def _run_bot_cycle(bots, candle_cache, fixed_symbols, orphan_prices, now,
                         strat.context = flow_cache.get(symbol)
                 strat.prepare(candles)
                 i = len(candles) - 1
-                sig = strat.signal(i)
+                raw_signal = strat.signal(i)
+                # Kräv att signalen håller i sig över flera cykler
+                sig = _confirmed_signal(bot["id"], symbol, raw_signal)
                 price = candles[i][4]
 
                 pos = positions.get(symbol)
@@ -626,14 +697,20 @@ def _run_bot_cycle(bots, candle_cache, fixed_symbols, orphan_prices, now,
                             reason = f"MAXTID: {held_hours:.0f}h ({pnl_pct:+.1f}%)"
 
                     if not exit_now:
+                        held_min = held_hours * 60
                         if cls.exit_mode == "signal":
-                            if sig == "sell":
+                            # Minsta hålltid gäller även signalbaserade exits.
+                            # Utan den stängdes positioner minuter efter köp.
+                            if sig == "sell" and held_min >= ARENA_MIN_HOLD_MINUTES:
                                 exit_now, reason = True, "SELL-signal"
                         else:
-                            held_min = held_hours * 60
                             exit_now, reason = momentum_strategy.check_exit(
                                 {"avg_entry_price": entry, "peak_price": peak},
                                 price, held_min,
+                                take_profit_pct=ARENA_TAKE_PROFIT_PCT,
+                                trailing_stop_pct=ARENA_TRAILING_STOP_PCT,
+                                max_hold_minutes=ARENA_MAX_HOLD_MINUTES,
+                                min_hold_minutes=ARENA_MIN_HOLD_MINUTES,
                             )
 
                     if exit_now:

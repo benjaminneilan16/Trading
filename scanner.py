@@ -47,7 +47,8 @@ def scan_stage1(exchange) -> list[dict]:
     Ett API-anrop, alla marknader. Returnerar de mest lovande USDT-paren
     baserat på 24h-volym och spread.
     """
-    tickers = exchange.fetch_tickers()
+    from collectors.exchange import fetch_all_tickers
+    tickers = fetch_all_tickers(exchange)
     candidates = []
 
     for symbol, t in tickers.items():

@@ -85,7 +85,9 @@ class Settings:
     # --- Bot-arena: en bot per strategi, tävlar mot varandra ---
     bots_enabled: bool = os.getenv("BOTS_ENABLED", "true").lower() in ("1", "true", "yes")
     # Hur ofta varje bot utvärderar sina signaler (sekunder)
-    bots_interval: int = int(os.getenv("BOTS_INTERVAL_SECONDS", "60"))
+    # Höjd från 60s till 300s: att utvärdera timbaserade strategier varje
+    # minut gav whipsaw och 2 694 affärer på två dygn.
+    bots_interval: int = int(os.getenv("BOTS_INTERVAL_SECONDS", "300"))
     bots_starting_balance: float = float(os.getenv("BOTS_STARTING_BALANCE", "1000"))
 
     # Blockera köp i tillgångar som rör sig likadant som något vi redan äger

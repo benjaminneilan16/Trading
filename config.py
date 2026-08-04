@@ -102,6 +102,9 @@ class Settings:
     # Hur ofta symbolregistret synkas (sekunder). Ett API-anrop per körning.
     listing_sync_interval: int = int(os.getenv("LISTING_SYNC_SECONDS", "600"))
 
+    # Hur ofta gammal data städas bort (sekunder). Standard: varje timme.
+    cleanup_interval: int = int(os.getenv("CLEANUP_INTERVAL_SECONDS", "3600"))
+
     # Telegram-notiser (se notifier.py för hur du skapar en bot)
     telegram_bot_token: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
     telegram_chat_id: str = os.getenv("TELEGRAM_CHAT_ID", "")

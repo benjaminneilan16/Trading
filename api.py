@@ -711,6 +711,137 @@ def bots_list(x_api_key: Optional[str] = Header(default=None)):
     return bots.list_bots()
 
 
+@app.get("/api/bots/analysis", tags=["bots"])
+def bots_analysis(x_api_key: Optional[str] = Header(default=None)):
+    """
+    Djupanalys av alla bottar — skiljer strategifel från friktionsfel.
+
+    Det avgörande måttet är BRUTTO mot NETTO: hur mycket priset rörde sig
+    mellan köp och sälj, jämfört med vad boten fick behålla.
+
+      Brutto positivt, netto negativt -> strategin har kant men handlar
+                                          för ofta. Justerbart.
+      Brutto negativt                 -> strategin gissar fel. Dött spår.
+
+    I topplistan ser båda fallen likadana ut. Här syns skillnaden.
+    """
+    check_key(x_api_key)
+    import analysis
+    return analysis.analyze_all()
+
+
+@app.get("/api/bots/diagnostics", tags=["bots"])
+def bot_diagnostics(x_api_key: Optional[str] = Header(default=None)):
+    """
+    Vad tycker varje bot om varje symbol JUST NU?
+
+    Finns för att svara på frågan "varför händer ingenting?". Utan detta
+    är en bot med noll affärer omöjlig att skilja från en trasig bot —
+    båda ser likadana ut i topplistan.
+    """
+    check_key(x_api_key)
+    import strategies as st
+    import bots as bot_mod
+    import orderflow, regime as regime_mod, social
+    from db import get_ohlcv
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc)
+
+    # Hämta candles en gång per symbol
+    candle_cache = {}
+    for sym in settings.symbols:
+        rows = get_ohlcv(sym, "1m", limit=200)
+        if len(rows) < 60:
+            continue
+        age_min = (now - rows[-1]["ts"]).total_seconds() / 60
+        if age_min > bot_mod.MAX_CANDLE_AGE_MINUTES:
+            continue
+        candle_cache[sym] = [
+            [int(r["ts"].timestamp() * 1000), float(r["open"]), float(r["high"]),
+             float(r["low"]), float(r["close"]), float(r["volume"])]
+            for r in rows
+        ]
+
+    if not candle_cache:
+        return {"error": "Ingen färsk candle-data tillgänglig", "symbols_checked": settings.symbols}
+
+    # Kontext för de strategier som behöver den
+    flow_cache, regime_cache, hype_cache = {}, {}, {}
+    for sym, candles in candle_cache.items():
+        try:
+            flow_cache[sym] = orderflow.get_flow_metrics(sym, 15)
+        except Exception:
+            pass
+        try:
+            regime_cache[sym] = regime_mod.detect_regime(candles)
+        except Exception:
+            pass
+        try:
+            hype_cache[sym] = social.hype_score(sym)
+        except Exception:
+            pass
+
+    results = []
+    for bot in bot_mod.list_bots():
+        cls = st.STRATEGY_MAP.get(bot["strategy"])
+        if cls is None:
+            continue
+        params = bot["params"] if isinstance(bot["params"], dict) else {}
+        held = {p["symbol"] for p in bot_mod._get_positions(bot["id"])}
+
+        signals = {}
+        for sym, candles in candle_cache.items():
+            try:
+                strat = cls(**params)
+                if cls.needs_context:
+                    if cls.name == "ensemble_ai":
+                        strat.context = {
+                            "symbol": sym, "flow": flow_cache.get(sym),
+                            "regime": regime_cache.get(sym), "hype": hype_cache.get(sym),
+                        }
+                    else:
+                        strat.context = flow_cache.get(sym)
+                strat.prepare(candles)
+                signals[sym] = strat.signal(len(candles) - 1)
+            except Exception as e:
+                signals[sym] = f"fel: {e}"
+
+        buys = [s for s, v in signals.items() if v == "buy"]
+        results.append({
+            "bot": bot["name"],
+            "strategy": bot["strategy"],
+            "enabled": bot["enabled"],
+            "open_positions": sorted(held),
+            "signals": signals,
+            "buy_signals_now": buys,
+            "would_trade": bool([s for s in buys if s not in held]),
+        })
+
+    active = [r for r in results if r["buy_signals_now"]]
+
+    return {
+        "checked_at": now,
+        "symbols_with_fresh_data": sorted(candle_cache.keys()),
+        "bots": results,
+        "summary": {
+            "bots_with_buy_signal": len(active),
+            "bots_total": len(results),
+            "note": (
+                "Ingen bot har köpsignal just nu. Det är normalt — de flesta "
+                "strategier väntar på specifika villkor som inträffar sällan. "
+                "Är det så här i flera dygn, kolla att trösklarna inte är för strikta."
+            ) if not active else
+            f"{len(active)} bottar har köpsignal just nu.",
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
+# Databasunderhåll
+# ---------------------------------------------------------------------------
+
+
 @app.get("/api/bots/{bot_id}", tags=["bots"])
 def bot_detail(bot_id: int, x_api_key: Optional[str] = Header(default=None)):
     """Full statistik för en enskild bot, inklusive öppna positioner."""
@@ -768,6 +899,24 @@ def bots_create(body: CreateBotRequest, x_api_key: Optional[str] = Header(defaul
     return result
 
 
+@app.post("/api/bots/reset-all", tags=["bots"])
+def bots_reset_all(x_api_key: Optional[str] = Header(default=None)):
+    """
+    Nollställer ALLA bottar. Använd när du vill starta en ny mätperiod,
+    t.ex. efter att ha ändrat strategiparametrar.
+    """
+    check_key(x_api_key)
+    import bots
+    bots.reset_all_bots()
+    send_notification("♻️ Alla bottar nollställda — ny mätperiod startad")
+    return {"status": "all_reset"}
+
+
+# ---------------------------------------------------------------------------
+# Order flow — vad köpare och säljare faktiskt gör
+# ---------------------------------------------------------------------------
+
+
 @app.post("/api/bots/{bot_id}/enable", tags=["bots"])
 def bot_enable(bot_id: int, enabled: bool = Query(True),
                x_api_key: Optional[str] = Header(default=None)):
@@ -785,23 +934,6 @@ def bot_reset(bot_id: int, x_api_key: Optional[str] = Header(default=None)):
     bots.reset_bot(bot_id)
     return {"id": bot_id, "status": "reset"}
 
-
-@app.post("/api/bots/reset-all", tags=["bots"])
-def bots_reset_all(x_api_key: Optional[str] = Header(default=None)):
-    """
-    Nollställer ALLA bottar. Använd när du vill starta en ny mätperiod,
-    t.ex. efter att ha ändrat strategiparametrar.
-    """
-    check_key(x_api_key)
-    import bots
-    bots.reset_all_bots()
-    send_notification("♻️ Alla bottar nollställda — ny mätperiod startad")
-    return {"status": "all_reset"}
-
-
-# ---------------------------------------------------------------------------
-# Order flow — vad köpare och säljare faktiskt gör
-# ---------------------------------------------------------------------------
 
 @app.get("/api/orderflow", tags=["orderflow"])
 def get_orderflow(
@@ -1050,117 +1182,6 @@ def health_check(x_api_key: Optional[str] = Header(default=None)):
     }
 
 
-@app.get("/api/bots/diagnostics", tags=["bots"])
-def bot_diagnostics(x_api_key: Optional[str] = Header(default=None)):
-    """
-    Vad tycker varje bot om varje symbol JUST NU?
-
-    Finns för att svara på frågan "varför händer ingenting?". Utan detta
-    är en bot med noll affärer omöjlig att skilja från en trasig bot —
-    båda ser likadana ut i topplistan.
-    """
-    check_key(x_api_key)
-    import strategies as st
-    import bots as bot_mod
-    import orderflow, regime as regime_mod, social
-    from db import get_ohlcv
-    from datetime import datetime, timezone
-
-    now = datetime.now(timezone.utc)
-
-    # Hämta candles en gång per symbol
-    candle_cache = {}
-    for sym in settings.symbols:
-        rows = get_ohlcv(sym, "1m", limit=200)
-        if len(rows) < 60:
-            continue
-        age_min = (now - rows[-1]["ts"]).total_seconds() / 60
-        if age_min > bot_mod.MAX_CANDLE_AGE_MINUTES:
-            continue
-        candle_cache[sym] = [
-            [int(r["ts"].timestamp() * 1000), float(r["open"]), float(r["high"]),
-             float(r["low"]), float(r["close"]), float(r["volume"])]
-            for r in rows
-        ]
-
-    if not candle_cache:
-        return {"error": "Ingen färsk candle-data tillgänglig", "symbols_checked": settings.symbols}
-
-    # Kontext för de strategier som behöver den
-    flow_cache, regime_cache, hype_cache = {}, {}, {}
-    for sym, candles in candle_cache.items():
-        try:
-            flow_cache[sym] = orderflow.get_flow_metrics(sym, 15)
-        except Exception:
-            pass
-        try:
-            regime_cache[sym] = regime_mod.detect_regime(candles)
-        except Exception:
-            pass
-        try:
-            hype_cache[sym] = social.hype_score(sym)
-        except Exception:
-            pass
-
-    results = []
-    for bot in bot_mod.list_bots():
-        cls = st.STRATEGY_MAP.get(bot["strategy"])
-        if cls is None:
-            continue
-        params = bot["params"] if isinstance(bot["params"], dict) else {}
-        held = {p["symbol"] for p in bot_mod._get_positions(bot["id"])}
-
-        signals = {}
-        for sym, candles in candle_cache.items():
-            try:
-                strat = cls(**params)
-                if cls.needs_context:
-                    if cls.name == "ensemble_ai":
-                        strat.context = {
-                            "symbol": sym, "flow": flow_cache.get(sym),
-                            "regime": regime_cache.get(sym), "hype": hype_cache.get(sym),
-                        }
-                    else:
-                        strat.context = flow_cache.get(sym)
-                strat.prepare(candles)
-                signals[sym] = strat.signal(len(candles) - 1)
-            except Exception as e:
-                signals[sym] = f"fel: {e}"
-
-        buys = [s for s, v in signals.items() if v == "buy"]
-        results.append({
-            "bot": bot["name"],
-            "strategy": bot["strategy"],
-            "enabled": bot["enabled"],
-            "open_positions": sorted(held),
-            "signals": signals,
-            "buy_signals_now": buys,
-            "would_trade": bool([s for s in buys if s not in held]),
-        })
-
-    active = [r for r in results if r["buy_signals_now"]]
-
-    return {
-        "checked_at": now,
-        "symbols_with_fresh_data": sorted(candle_cache.keys()),
-        "bots": results,
-        "summary": {
-            "bots_with_buy_signal": len(active),
-            "bots_total": len(results),
-            "note": (
-                "Ingen bot har köpsignal just nu. Det är normalt — de flesta "
-                "strategier väntar på specifika villkor som inträffar sällan. "
-                "Är det så här i flera dygn, kolla att trösklarna inte är för strikta."
-            ) if not active else
-            f"{len(active)} bottar har köpsignal just nu.",
-        },
-    }
-
-
-# ---------------------------------------------------------------------------
-# Databasunderhåll
-# ---------------------------------------------------------------------------
-
 @app.get("/api/db/size", tags=["meta"])
 def db_size(x_api_key: Optional[str] = Header(default=None)):
     """
@@ -1193,25 +1214,6 @@ def db_emergency(x_api_key: Optional[str] = Header(default=None)):
     result = cleanup.emergency_truncate_orderbook()
     send_notification(f"🧹 Nödtömning: {result['freed_mb']} MB frigjort")
     return result
-
-
-@app.get("/api/bots/analysis", tags=["bots"])
-def bots_analysis(x_api_key: Optional[str] = Header(default=None)):
-    """
-    Djupanalys av alla bottar — skiljer strategifel från friktionsfel.
-
-    Det avgörande måttet är BRUTTO mot NETTO: hur mycket priset rörde sig
-    mellan köp och sälj, jämfört med vad boten fick behålla.
-
-      Brutto positivt, netto negativt -> strategin har kant men handlar
-                                          för ofta. Justerbart.
-      Brutto negativt                 -> strategin gissar fel. Dött spår.
-
-    I topplistan ser båda fallen likadana ut. Här syns skillnaden.
-    """
-    check_key(x_api_key)
-    import analysis
-    return analysis.analyze_all()
 
 
 @app.get("/api/bots/{bot_id}/analysis", tags=["bots"])

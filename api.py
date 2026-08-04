@@ -1155,3 +1155,41 @@ def bot_diagnostics(x_api_key: Optional[str] = Header(default=None)):
             f"{len(active)} bottar har köpsignal just nu.",
         },
     }
+
+
+# ---------------------------------------------------------------------------
+# Databasunderhåll
+# ---------------------------------------------------------------------------
+
+@app.get("/api/db/size", tags=["meta"])
+def db_size(x_api_key: Optional[str] = Header(default=None)):
+    """
+    Storlek per tabell. Kolla denna om Railway varnar för full disk —
+    den visar direkt vad som växer.
+    """
+    check_key(x_api_key)
+    import cleanup
+    return cleanup.database_size()
+
+
+@app.post("/api/db/cleanup", tags=["meta"])
+def db_cleanup(x_api_key: Optional[str] = Header(default=None)):
+    """Kör städningen direkt istället för att vänta på schemat."""
+    check_key(x_api_key)
+    import cleanup
+    return {"deleted": cleanup.run_cleanup(), **cleanup.database_size()}
+
+
+@app.post("/api/db/emergency-truncate", tags=["meta"])
+def db_emergency(x_api_key: Optional[str] = Header(default=None)):
+    """
+    NÖDLÄGE: tömmer orderbook_snapshots helt och frigör utrymmet direkt.
+
+    Använd när databasen är nästan full. Datan är säker att kasta —
+    order flow använder bara senaste snapshotten.
+    """
+    check_key(x_api_key)
+    import cleanup
+    result = cleanup.emergency_truncate_orderbook()
+    send_notification(f"🧹 Nödtömning: {result['freed_mb']} MB frigjort")
+    return result

@@ -26,6 +26,7 @@ import strategies
 import momentum_strategy
 import orderflow
 from backtest import FEE_PCT, SLIPPAGE_PCT
+from notifier import send_notification
 
 logger = logging.getLogger("bots")
 
@@ -178,6 +179,10 @@ def _bot_buy(bot: dict, symbol: str, price: float, reason: str):
             (bot["id"], symbol, price, amount, spend, fees, reason),
         )
     logger.info("[%s] KÖP %s @ %.8f — %s", bot["name"], symbol, price, reason)
+    _cycle_events.append({
+        "type": "buy", "bot": bot["name"], "symbol": symbol,
+        "price": price, "reason": reason,
+    })
     return True
 
 
@@ -207,6 +212,10 @@ def _bot_sell(bot: dict, position: dict, price: float, reason: str):
         )
     logger.info("[%s] SÄLJ %s @ %.8f — %s (PnL %.2f)",
                 bot["name"], position["symbol"], price, reason, realized_pnl)
+    _cycle_events.append({
+        "type": "sell", "bot": bot["name"], "symbol": position["symbol"],
+        "price": price, "reason": reason, "pnl": realized_pnl,
+    })
     return realized_pnl
 
 
@@ -229,6 +238,16 @@ def _get_positions(bot_id: int) -> list[dict]:
 MAX_DYNAMIC_SYMBOLS = int(__import__("os").getenv("MAX_DYNAMIC_SYMBOLS", "15"))
 DYNAMIC_WATCHLIST_ENABLED = __import__("os").getenv(
     "DYNAMIC_WATCHLIST_ENABLED", "true").lower() in ("1", "true", "yes")
+
+# Notisläge för arenan:
+#   "all"   — köp och sälj
+#   "sells" — bara avslutade affärer (resultatet är det intressanta)
+#   "off"   — inga notiser
+#
+# Notiserna samlas ihop per cykel och skickas som ETT meddelande. Tolv
+# bottar som handlar samtidigt skulle annars ge tio separata notiser inom
+# några sekunder, och då slutar man läsa dem.
+BOT_NOTIFICATIONS = __import__("os").getenv("BOT_NOTIFICATIONS", "all").lower()
 # Hur länge kandidatlistan återanvänds (sekunder). Att bygga den kostar
 # ett API-anrop per symbol, så vi gör det inte varje botcykel.
 WATCHLIST_TTL_SECONDS = 300
@@ -300,6 +319,65 @@ def build_dynamic_watchlist(exchange) -> tuple[dict, dict]:
     logger.info("Dynamisk bevakningslista: %d symboler (%s)",
                 len(candles), ", ".join(list(candles)[:5]))
     return candles, tickers
+
+
+# Buffert för händelser under en cykel, töms av _flush_notifications()
+_cycle_events: list[dict] = []
+
+
+def _flush_notifications():
+    """
+    Skickar ETT samlat meddelande för allt som hänt under cykeln.
+
+    Säkerhetsstopp och maxtid-exits lyfts fram separat, eftersom de betyder
+    att strategins egen logik inte räckte till — det är viktigare
+    information än en vanlig affär.
+    """
+    global _cycle_events
+    events, _cycle_events = _cycle_events, []
+
+    if not events or BOT_NOTIFICATIONS == "off":
+        return
+
+    buys = [e for e in events if e["type"] == "buy"]
+    sells = [e for e in events if e["type"] == "sell"]
+
+    if BOT_NOTIFICATIONS == "sells":
+        buys = []
+
+    if not buys and not sells:
+        return
+
+    lines = []
+
+    if sells:
+        total_pnl = sum(e.get("pnl") or 0 for e in sells)
+        emoji = "✅" if total_pnl >= 0 else "🔻"
+        lines.append(f"{emoji} {len(sells)} avslut · {total_pnl:+.2f} USDT")
+        for e in sells[:8]:
+            pnl = e.get("pnl") or 0
+            mark = "🟢" if pnl >= 0 else "🔴"
+            # Säkerhetsnätet får en egen markering
+            if "SÄKERHETSSTOPP" in e["reason"] or "MAXTID" in e["reason"]:
+                mark = "⚠️"
+            lines.append(f"{mark} {e['bot']} · {e['symbol']} · {pnl:+.2f}")
+            lines.append(f"   {e['reason'][:70]}")
+        if len(sells) > 8:
+            lines.append(f"   (+{len(sells) - 8} till)")
+
+    if buys:
+        if lines:
+            lines.append("")
+        lines.append(f"🟢 {len(buys)} nya köp")
+        for e in buys[:8]:
+            lines.append(f"· {e['bot']} · {e['symbol']} @ {e['price']:.6f}")
+        if len(buys) > 8:
+            lines.append(f"   (+{len(buys) - 8} till)")
+
+    try:
+        send_notification("\n".join(lines))
+    except Exception as e:
+        logger.error("Kunde inte skicka botnotis: %s", e)
 
 
 def run_all_bots(symbols: list[str], timeframe: str = "1m", exchange=None):
@@ -432,6 +510,17 @@ def run_all_bots(symbols: list[str], timeframe: str = "1m", exchange=None):
 
     now = datetime.now(timezone.utc)
 
+    try:
+        _run_bot_cycle(bots, candle_cache, fixed_symbols, orphan_prices, now,
+                       flow_cache, regime_cache, hype_cache, kill_switch_on)
+    finally:
+        # Skickas ALLTID, även om en bot kraschar mitt i cykeln.
+        # Annars skulle affärer försvinna tyst ur notisflödet.
+        _flush_notifications()
+
+
+def _run_bot_cycle(bots, candle_cache, fixed_symbols, orphan_prices, now,
+                   flow_cache, regime_cache, hype_cache, kill_switch_on):
     for bot in bots:
         cls = strategies.STRATEGY_MAP.get(bot["strategy"])
         if cls is None:

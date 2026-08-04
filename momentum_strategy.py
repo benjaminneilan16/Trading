@@ -77,6 +77,10 @@ def check_exit(
     current_price: float,
     held_minutes: float,
     stop_loss_pct: float | None = None,
+    take_profit_pct: float | None = None,
+    trailing_stop_pct: float | None = None,
+    max_hold_minutes: float | None = None,
+    min_hold_minutes: float = 0.0,
 ) -> tuple[bool, str]:
     """
     Kollar alla exit-regler för en öppen position.
@@ -90,29 +94,40 @@ def check_exit(
     """
     entry = float(position["avg_entry_price"])
     peak = float(position.get("peak_price") or entry)
+
     stop = stop_loss_pct if stop_loss_pct is not None else STOP_LOSS_PCT
+    take_profit = take_profit_pct if take_profit_pct is not None else TAKE_PROFIT_PCT
+    trailing = trailing_stop_pct if trailing_stop_pct is not None else TRAILING_STOP_PCT
+    max_hold = max_hold_minutes if max_hold_minutes is not None else MAX_HOLD_MINUTES
 
     pnl_pct = (current_price - entry) / entry * 100
 
-    # 1. Take profit
-    if pnl_pct >= TAKE_PROFIT_PCT:
-        return True, f"TAKE PROFIT: +{pnl_pct:.2f}%"
-
-    # 2. Stop loss (dynamisk om Risk Manager satt en)
+    # 1. Stop loss går ALLTID före minsta hålltid — en position som rasar
+    #    ska inte behöva vänta ut en tidsgräns.
     if pnl_pct <= stop:
         return True, f"STOP LOSS: {pnl_pct:.2f}% (gräns {stop:.1f}%)"
 
-    # 3. Trailing stop — bara aktiv om vi varit i vinst
+    # 2. Minsta hålltid: hindrar att en position stängs minuter efter köp.
+    #    Utan denna spärr blev median-hålltiden 10 minuter på vissa bottar,
+    #    och en affär hinner aldrig täcka sina egna kostnader på den tiden.
+    if held_minutes < min_hold_minutes:
+        return False, f"minsta hålltid ({held_minutes:.0f}/{min_hold_minutes:.0f} min)"
+
+    # 3. Take profit
+    if pnl_pct >= take_profit:
+        return True, f"TAKE PROFIT: +{pnl_pct:.2f}%"
+
+    # 4. Trailing stop — bara aktiv om vi varit i vinst
     if peak > entry:
         drop_from_peak_pct = (peak - current_price) / peak * 100
-        if drop_from_peak_pct >= TRAILING_STOP_PCT:
+        if drop_from_peak_pct >= trailing:
             return True, (
                 f"TRAILING STOP: -{drop_from_peak_pct:.2f}% från topp "
                 f"(totalt {pnl_pct:+.2f}%)"
             )
 
-    # 4. Time exit
-    if held_minutes >= MAX_HOLD_MINUTES:
+    # 5. Time exit
+    if held_minutes >= max_hold:
         return True, f"TIME EXIT: {held_minutes:.0f} min utan utfall ({pnl_pct:+.2f}%)"
 
     return False, f"håller kvar ({pnl_pct:+.2f}%)"

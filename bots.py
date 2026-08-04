@@ -271,7 +271,8 @@ def build_dynamic_watchlist(exchange) -> tuple[dict, dict]:
         return _watchlist_cache["candles"], _watchlist_cache["tickers"]
 
     try:
-        tickers = exchange.fetch_tickers()
+        from collectors.exchange import fetch_all_tickers
+        tickers = fetch_all_tickers(exchange)
     except Exception as e:
         logger.error("Kunde inte hämta tickers för bevakningslistan: %s", e)
         return _watchlist_cache["candles"], _watchlist_cache["tickers"]

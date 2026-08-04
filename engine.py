@@ -25,6 +25,7 @@ import technical
 import bots as bot_arena
 import reporting
 import newlistings
+import cleanup
 from notifier import send_notification
 
 logger = logging.getLogger("engine")
@@ -285,6 +286,15 @@ class EngineManager:
                     600,  # kollar var 10:e minut, skickar en gång per dygn
                     reporting.maybe_send_daily_report,
                 ))
+
+            # Datastädning — hindrar databasen från att fyllas.
+            # Körs oavsett om bottarna är på, eftersom insamlingen fyller
+            # databasen även när ingen handlar.
+            jobs.append((
+                "cleanup",
+                settings.cleanup_interval,
+                cleanup.run_cleanup,
+            ))
 
             if settings.track_new_listings:
                 jobs.append((

@@ -111,6 +111,11 @@ def _confirmed_signal(bot_id: int, symbol: str, signal: str) -> str:
     bekräftelser krävs att signalen håller i sig — vilket sållar bort
     en stor del av brusaffärerna.
     """
+    # Med dynamisk bevakningslista dyker nya symboler upp hela tiden.
+    # Utan tak skulle minnet växa obegränsat under veckor av drift.
+    if len(_signal_history) > 5000:
+        _signal_history.clear()
+
     key = (bot_id, symbol)
     history = _signal_history.get(key, [])
     history.append(signal)
@@ -208,13 +213,35 @@ def reset_all_bots():
 # Handel
 # ---------------------------------------------------------------------------
 
-def _bot_buy(bot: dict, symbol: str, price: float, reason: str):
+def effective_slippage(symbol: str, tickers: dict) -> float:
+    """
+    Slippage baserad på faktisk spread istället för en fast siffra.
+
+    VARFÖR: 0,15% fast slippage är rimligt för BTC men grovt optimistiskt
+    för en småtoken med 0,8% spread. Att korsa spreaden kostar minst
+    halva den — och när bottarna nu jagar småtokens skulle en fast siffra
+    göra resultaten systematiskt för positiva.
+
+    Att överskatta sina kostnader är billigt. Att underskatta dem betyder
+    att en strategi ser lönsam ut på papper och förlorar pengar på riktigt.
+    """
+    t = tickers.get(symbol) or {}
+    bid, ask = t.get("bid"), t.get("ask")
+    if bid and ask and bid > 0:
+        half_spread = (ask - bid) / bid * 100 / 2
+        return max(SLIPPAGE_PCT, half_spread)
+    return SLIPPAGE_PCT
+
+
+def _bot_buy(bot: dict, symbol: str, price: float, reason: str,
+             slippage_pct: float = None):
     spend = float(bot["quote_balance"]) * float(bot["position_size_pct"])
     if spend < 10:
         return False
 
+    slip = SLIPPAGE_PCT if slippage_pct is None else slippage_pct
     # Slippage + avgift gör att du får färre tokens än det "borde" bli
-    effective_price = price * (1 + SLIPPAGE_PCT / 100) * (1 + FEE_PCT / 100)
+    effective_price = price * (1 + slip / 100) * (1 + FEE_PCT / 100)
     amount = spend / effective_price
     fees = spend - (spend / (1 + FEE_PCT / 100))
 
@@ -247,11 +274,13 @@ def _bot_buy(bot: dict, symbol: str, price: float, reason: str):
     return True
 
 
-def _bot_sell(bot: dict, position: dict, price: float, reason: str):
+def _bot_sell(bot: dict, position: dict, price: float, reason: str,
+              slippage_pct: float = None):
     amount = float(position["amount"])
     entry = float(position["entry_price"])
 
-    effective_price = price * (1 - SLIPPAGE_PCT / 100) * (1 - FEE_PCT / 100)
+    slip = SLIPPAGE_PCT if slippage_pct is None else slippage_pct
+    effective_price = price * (1 - slip / 100) * (1 - FEE_PCT / 100)
     proceeds = amount * effective_price
     fees = amount * price - proceeds
     realized_pnl = (effective_price - entry) * amount
@@ -577,7 +606,8 @@ def run_all_bots(symbols: list[str], timeframe: str = "1m", exchange=None):
 
     try:
         _run_bot_cycle(bots, candle_cache, fixed_symbols, orphan_prices, now,
-                       flow_cache, regime_cache, hype_cache, kill_switch_on)
+                       flow_cache, regime_cache, hype_cache, kill_switch_on,
+                       all_tickers)
     finally:
         # Skickas ALLTID, även om en bot kraschar mitt i cykeln.
         # Annars skulle affärer försvinna tyst ur notisflödet.
@@ -585,7 +615,9 @@ def run_all_bots(symbols: list[str], timeframe: str = "1m", exchange=None):
 
 
 def _run_bot_cycle(bots, candle_cache, fixed_symbols, orphan_prices, now,
-                   flow_cache, regime_cache, hype_cache, kill_switch_on):
+                   flow_cache, regime_cache, hype_cache, kill_switch_on,
+                   all_tickers=None):
+    all_tickers = all_tickers or {}
     for bot in bots:
         cls = strategies.STRATEGY_MAP.get(bot["strategy"])
         if cls is None:
@@ -667,7 +699,9 @@ def _run_bot_cycle(bots, candle_cache, fixed_symbols, orphan_prices, now,
                             continue
                         # Ladda om saldot — tidigare köp i samma cykel kan ha ändrat det
                         fresh = next((b for b in list_bots() if b["id"] == bot["id"]), bot)
-                        if _bot_buy(fresh, symbol, price, f"{strat.describe()} signal"):
+                        slip = effective_slippage(symbol, all_tickers)
+                        if _bot_buy(fresh, symbol, price,
+                                    f"{strat.describe()} signal", slippage_pct=slip):
                             # Håll räkningen aktuell inom samma cykel
                             positions[symbol] = {"symbol": symbol}
                 else:
@@ -715,7 +749,8 @@ def _run_bot_cycle(bots, candle_cache, fixed_symbols, orphan_prices, now,
 
                     if exit_now:
                         fresh = next((b for b in list_bots() if b["id"] == bot["id"]), bot)
-                        _bot_sell(fresh, pos, price, reason)
+                        _bot_sell(fresh, pos, price, reason,
+                                  slippage_pct=effective_slippage(symbol, all_tickers))
 
             except Exception as e:
                 logger.error("Bot %s fel på %s: %s", bot["name"], symbol, e)

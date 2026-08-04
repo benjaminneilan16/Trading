@@ -249,4 +249,22 @@ def get_ohlcv_resampled(symbol: str, minutes: int = 5, limit: int = 200) -> list
          "close": r[4], "volume": r[5]}
         for r in rows
     ]
-    return list(reversed(out))  # äldst -> nyast
+    out = list(reversed(out))  # äldst -> nyast
+
+    # KASTA DEN SENASTE CANDLEN OM DEN INTE ÄR FÄRDIG.
+    #
+    # Den pågående 5-minuterscandlen kan bestå av en enda minut. Volymen
+    # ser då ut som en femtedel av vad den blir, och "close" är inte
+    # stängningspriset utan bara senaste pris.
+    #
+    # Det slår hårdast mot volymstrategier, som jämför aktuell volym mot
+    # ett snitt — de skulle systematiskt se för låg volym och missa
+    # signaler. Standard inom handel är att bara agera på stängda candles.
+    if out:
+        from datetime import datetime, timezone, timedelta
+        last_bucket_start = out[-1]["ts"]
+        bucket_end = last_bucket_start + timedelta(minutes=minutes)
+        if datetime.now(timezone.utc) < bucket_end:
+            out = out[:-1]
+
+    return out

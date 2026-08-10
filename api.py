@@ -1228,3 +1228,81 @@ def bot_analysis_single(bot_id: int, x_api_key: Optional[str] = Header(default=N
     if row is None:
         raise HTTPException(status_code=404, detail="Bot finns inte")
     return analysis.analyze_bot(row[0], row[1], row[2])
+
+
+# ---------------------------------------------------------------------------
+# On-chain features (DexScreener)
+# ---------------------------------------------------------------------------
+
+@app.get("/api/onchain/features", tags=["onchain"])
+def onchain_features(
+    symbol: str = Query(..., description="T.ex. PEPE/USDT"),
+    x_api_key: Optional[str] = Header(default=None),
+):
+    """
+    Senaste on-chain features för en symbol: likviditet, market cap,
+    buy/sell-ratio, tokenålder.
+
+    Detta är information som INTE går att räkna fram ur ett prisdiagram —
+    till skillnad från alla tekniska indikatorer, som räknar på samma
+    prisserie i olika förpackningar.
+    """
+    check_key(x_api_key)
+    import onchain
+    f = onchain.latest_features(symbol, max_age_minutes=120)
+    if f is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Inga färska features. Symbolen kanske saknar DEX-par, "
+                   "eller så har insamlingen inte hunnit köra än.",
+        )
+    return f
+
+
+@app.get("/api/onchain/coverage", tags=["onchain"])
+def onchain_coverage(x_api_key: Optional[str] = Header(default=None)):
+    """Hur många symboler som matchats mot DEX-par, och hur mycket data som finns."""
+    check_key(x_api_key)
+    import onchain
+    return onchain.coverage_stats()
+
+
+@app.post("/api/onchain/collect", tags=["onchain"])
+def onchain_collect(
+    symbols: Optional[str] = Query(None, description="Kommaseparerat. Tomt = bevakade symboler"),
+    x_api_key: Optional[str] = Header(default=None),
+):
+    """
+    Hämta features direkt istället för att vänta på schemat.
+
+    Bra att köra ett par gånger efter uppsättning — första körningen
+    behöver slå upp DEX-paret för varje symbol, vilket tar längre tid.
+    """
+    check_key(x_api_key)
+    import onchain
+    syms = ([s.strip() for s in symbols.split(",") if s.strip()]
+            if symbols else list(settings.symbols))
+    result = onchain.collect_for_symbols(syms)
+    return {**result, **onchain.coverage_stats()}
+
+
+@app.get("/api/onchain/map", tags=["onchain"])
+def onchain_map(x_api_key: Optional[str] = Header(default=None)):
+    """
+    Vilka DEX-par symbolerna matchats mot.
+
+    Värt att granska: samma ticker kan finnas på dussintals kontrakt.
+    Vi väljer det med högst likviditet, men fel kan smyga sig in — och
+    då blir alla features för den symbolen felaktiga.
+    """
+    check_key(x_api_key)
+    from db import get_cursor
+    with get_cursor(commit=False) as cur:
+        cur.execute(
+            "SELECT symbol, chain_id, dex_id, pair_address, token_address, "
+            "matched_liquidity_usd, match_failed, matched_at "
+            "FROM token_dex_map ORDER BY match_failed, matched_liquidity_usd DESC NULLS LAST"
+        )
+        cols = [c.name for c in cur.description]
+        rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+    return {"mappings": rows, "count": len(rows)}

@@ -258,13 +258,32 @@ def _bot_buy(bot: dict, symbol: str, price: float, reason: str,
             """,
             (bot["id"], symbol, amount, effective_price, price),
         )
+        # Spara vilka förutsättningar som rådde vid entry.
+        #
+        # Utan detta går det inte att i efterhand svara på frågan "vilka
+        # signaler bidrog faktiskt till utfallet?". Att hämta features i
+        # efterhand fungerar inte — DexScreener har ingen historik, så
+        # informationen finns bara i det ögonblick affären togs.
+        features = None
+        try:
+            import onchain, json as _json
+            f = onchain.latest_features(symbol)
+            if f:
+                features = _json.dumps({
+                    k: (float(v) if hasattr(v, "__float__") else str(v))
+                    for k, v in f.items()
+                    if k not in ("id", "symbol") and v is not None
+                })
+        except Exception:
+            pass
+
         cur.execute(
             """
             INSERT INTO bot_trades (bot_id, symbol, side, price, amount,
-                                    quote_amount, fees_paid, reason)
-            VALUES (%s, %s, 'buy', %s, %s, %s, %s, %s)
+                                    quote_amount, fees_paid, reason, features)
+            VALUES (%s, %s, 'buy', %s, %s, %s, %s, %s, %s)
             """,
-            (bot["id"], symbol, price, amount, spend, fees, reason),
+            (bot["id"], symbol, price, amount, spend, fees, reason, features),
         )
     logger.info("[%s] KÖP %s @ %.8f — %s", bot["name"], symbol, price, reason)
     _cycle_events.append({

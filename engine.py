@@ -27,9 +27,31 @@ import reporting
 import newlistings
 import cleanup
 import onchain
+import token_identity
+import arbitrage
 from notifier import send_notification
 
 logger = logging.getLogger("engine")
+
+
+def observe_arbitrage():
+    """
+    Observerar spreadar mellan DEX och KuCoin. HANDLAR INTE.
+
+    Syftet är att svara på en enda fråga efter mätperioden: uppstår det
+    överhuvudtaget prisskillnader som överlever gas, avgifter och slippage?
+    """
+    symbols = list(settings.symbols)
+    try:
+        from db import get_cursor
+        with get_cursor(commit=False) as cur:
+            cur.execute("SELECT DISTINCT symbol FROM token_dex_map WHERE match_failed = FALSE")
+            symbols += [r[0] for r in cur.fetchall()]
+    except Exception as e:
+        logger.debug("Kunde inte hämta matchade symboler: %s", e)
+
+    unique = list(dict.fromkeys(symbols))
+    arbitrage.observe_all(unique, settings.arbitrage_trade_size_usd)
 
 
 def collect_onchain_features():
@@ -323,6 +345,19 @@ class EngineManager:
                     "onchain_features",
                     settings.onchain_interval,
                     collect_onchain_features,
+                ))
+                # KuCoins valutaregister ändras sällan — en gång i timmen räcker
+                jobs.append((
+                    "kucoin_currencies",
+                    3600,
+                    token_identity.sync_kucoin_currencies,
+                ))
+
+            if settings.arbitrage_observer_enabled:
+                jobs.append((
+                    "arbitrage_observer",
+                    settings.arbitrage_interval,
+                    observe_arbitrage,
                 ))
 
             # Datastädning — hindrar databasen från att fyllas.

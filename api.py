@@ -1306,3 +1306,143 @@ def onchain_map(x_api_key: Optional[str] = Header(default=None)):
         cols = [c.name for c in cur.description]
         rows = [dict(zip(cols, r)) for r in cur.fetchall()]
     return {"mappings": rows, "count": len(rows)}
+
+
+@app.post("/api/onchain/reset", tags=["onchain"])
+def onchain_reset(x_api_key: Optional[str] = Header(default=None)):
+    """
+    Nollställ alla DEX-matchningar och insamlade features.
+
+    Kör detta efter att matchningsmetoden ändrats. De första
+    matchningarna gjordes på ticker och pekade i flera fall på
+    bluff-tokens med samma symbol — BTC matchades mot ett Solana-token
+    med 8 miljarder i påstådd likviditet. All data byggd på dem är
+    oanvändbar och måste bort innan ny insamling börjar.
+    """
+    check_key(x_api_key)
+    import onchain
+    return onchain.reset_mappings()
+
+
+# ---------------------------------------------------------------------------
+# Token identity & transferability
+# ---------------------------------------------------------------------------
+
+@app.get("/api/identity/networks", tags=["identity"])
+def identity_networks(
+    symbol: str = Query(..., description="T.ex. PEPE/USDT eller bara PEPE"),
+    x_api_key: Optional[str] = Header(default=None),
+):
+    """Alla kedjor KuCoin listar tokenen på, med kontraktsadress och transferstatus."""
+    check_key(x_api_key)
+    import token_identity
+    currency = symbol.split("/")[0].split(":")[0].upper()
+    return {"currency": currency, "networks": token_identity.get_networks(currency)}
+
+
+@app.get("/api/identity/transferability", tags=["identity"])
+def identity_transferability(
+    symbol: str = Query(...),
+    x_api_key: Optional[str] = Header(default=None),
+):
+    """
+    Kan token faktiskt flyttas? Kedjan network compatible -> deposit enabled
+    -> withdraw enabled, med anledning för varje kedja som föll bort.
+
+    Att uttag är avstängt är en varningssignal i sig, inte bara ett hinder.
+    """
+    check_key(x_api_key)
+    import token_identity
+    return token_identity.check_transferability(symbol)
+
+
+@app.get("/api/identity/confidence", tags=["identity"])
+def identity_confidence(
+    symbol: str = Query(...),
+    chain: str = Query(..., description="DEX-kedjan, t.ex. 'solana'"),
+    token_address: str = Query(..., description="Kontraktsadressen från DEX"),
+    x_api_key: Optional[str] = Header(default=None),
+):
+    """Hur säkra är vi på att DEX-tokenen är samma som KuCoin listar?"""
+    check_key(x_api_key)
+    import token_identity
+    return token_identity.match_confidence(symbol, chain, token_address)
+
+
+@app.post("/api/identity/sync", tags=["identity"])
+def identity_sync(x_api_key: Optional[str] = Header(default=None)):
+    """Hämtar KuCoins valutaregister: kontrakt, kedjor, avgifter, transferstatus."""
+    check_key(x_api_key)
+    import token_identity
+    result = token_identity.sync_kucoin_currencies()
+    return {**result, **token_identity.coverage()}
+
+
+@app.get("/api/identity/coverage", tags=["identity"])
+def identity_coverage(x_api_key: Optional[str] = Header(default=None)):
+    check_key(x_api_key)
+    import token_identity
+    return token_identity.coverage()
+
+
+# ---------------------------------------------------------------------------
+# Arbitrage-observatör
+# ---------------------------------------------------------------------------
+
+@app.get("/api/arbitrage/summary", tags=["arbitrage"])
+def arbitrage_summary(
+    hours: int = Query(168, ge=1, le=8760),
+    x_api_key: Optional[str] = Header(default=None),
+):
+    """
+    Svaret på om arbitrage är värt att bygga: uppstår det spreadar som
+    överlever kostnaderna, hur ofta, och på vilka kedjor?
+
+    Läs 'verdict' först, och 'per_chain' därefter — om träffarna är
+    koncentrerade till lågkostnadskedjor är det ett riktigt mönster.
+    """
+    check_key(x_api_key)
+    import arbitrage
+    return arbitrage.summary(hours)
+
+
+@app.get("/api/arbitrage/check", tags=["arbitrage"])
+def arbitrage_check(
+    symbol: str = Query(...),
+    trade_size_usd: float = Query(200.0, gt=0),
+    x_api_key: Optional[str] = Header(default=None),
+):
+    """
+    Full kostnadssimulering för en symbol just nu.
+
+    Visar nominell spread mot exekverbar marginal, uppdelat på
+    inventory-arbitrage (kapital på båda sidor) och transfer-arbitrage
+    (köp, flytta, sälj).
+    """
+    check_key(x_api_key)
+    import arbitrage
+    r = arbitrage.observe(symbol, trade_size_usd)
+    if r is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Saknar färsk DEX- eller KuCoin-data för symbolen.",
+        )
+    return r
+
+
+@app.get("/api/arbitrage/observations", tags=["arbitrage"])
+def arbitrage_observations(
+    limit: int = Query(50, ge=1, le=500),
+    profitable_only: bool = Query(False),
+    x_api_key: Optional[str] = Header(default=None),
+):
+    check_key(x_api_key)
+    from db import get_cursor
+    where = "WHERE inventory_profitable = TRUE" if profitable_only else ""
+    with get_cursor(commit=False) as cur:
+        cur.execute(
+            f"SELECT * FROM arbitrage_observations {where} ORDER BY ts DESC LIMIT %s",
+            (limit,),
+        )
+        cols = [c.name for c in cur.description]
+        return [dict(zip(cols, r)) for r in cur.fetchall()]

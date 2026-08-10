@@ -26,9 +26,40 @@ import bots as bot_arena
 import reporting
 import newlistings
 import cleanup
+import onchain
 from notifier import send_notification
 
 logger = logging.getLogger("engine")
+
+
+def collect_onchain_features():
+    """
+    Hämtar on-chain features för bevakade symboler plus de som bottarna
+    just nu äger.
+
+    Öppna positioner prioriteras: det är för dem vi behöver veta om
+    likviditeten försvinner eller säljtrycket ökar.
+    """
+    symbols = list(settings.symbols)
+
+    # Lägg till symboler som någon bot faktiskt håller
+    try:
+        from db import get_cursor
+        with get_cursor(commit=False) as cur:
+            cur.execute("SELECT DISTINCT symbol FROM bot_positions")
+            symbols += [r[0] for r in cur.fetchall()]
+    except Exception as e:
+        logger.debug("Kunde inte hämta öppna positioner: %s", e)
+
+    # Och de symboler som står högst i den dynamiska bevakningslistan
+    try:
+        watch = list(bot_arena._watchlist_cache.get("candles", {}).keys())
+        symbols += watch[:15]
+    except Exception:
+        pass
+
+    unique = list(dict.fromkeys(symbols))
+    onchain.collect_for_symbols(unique)
 
 
 def sync_new_listings(exchange):
@@ -285,6 +316,13 @@ class EngineManager:
                     "daily_report",
                     600,  # kollar var 10:e minut, skickar en gång per dygn
                     reporting.maybe_send_daily_report,
+                ))
+
+            if settings.onchain_enabled:
+                jobs.append((
+                    "onchain_features",
+                    settings.onchain_interval,
+                    collect_onchain_features,
                 ))
 
             # Datastädning — hindrar databasen från att fyllas.

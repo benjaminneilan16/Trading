@@ -139,14 +139,70 @@ def _base_symbol(symbol: str) -> str:
     return symbol.split("/")[0].split(":")[0].upper()
 
 
+KUCOIN_CURRENCIES_URL = "https://api.kucoin.com/api/v3/currencies"
+
+# Cache av KuCoins kontraktsadresser. Hämtas en gång per körning.
+_kucoin_contracts: dict | None = None
+
+
+def load_kucoin_contracts(force: bool = False) -> dict:
+    """
+    Hämtar KuCoins egen förteckning över vilka kontrakt de listar.
+
+    VARFÖR DETTA ÄR NÖDVÄNDIGT: att söka på ticker fungerar inte. Första
+    försöket matchade BTC/USDT mot ett Solana-token med adressen
+    BTCEDZwA... och 8 miljarder i påstådd likviditet. Det är inte Bitcoin.
+    Samma sak för ETH, LINK, DOT, ADA och XRP — alla matchades mot
+    bluff-tokens med samma ticker.
+
+    Bluffar kan visa upp godtyckligt hög likviditet: det räcker att lägga
+    ett värdelöst token mot lite SOL och sätta priset själv. Att välja
+    "högst likviditet" skyddar alltså inte alls.
+
+    KuCoin vet vilket kontrakt de listar. Det är per definition rätt
+    token, eftersom det är den du handlar.
+
+    Returnerar {"PEPE": [{"chain": "eth", "address": "0x6982..."}, ...]}
+    """
+    global _kucoin_contracts
+    if _kucoin_contracts is not None and not force:
+        return _kucoin_contracts
+
+    data = _throttled_get(KUCOIN_CURRENCIES_URL)
+    contracts = {}
+    if data:
+        for cur in data.get("data") or []:
+            code = (cur.get("currency") or "").upper()
+            chains = []
+            for ch in cur.get("chains") or []:
+                addr = (ch.get("contractAddress") or "").strip()
+                if addr:
+                    chains.append({
+                        "chain": ch.get("chainName") or ch.get("chainId"),
+                        "address": addr,
+                    })
+            if chains:
+                contracts[code] = chains
+    _kucoin_contracts = contracts
+    logger.info("Hämtade kontraktsadresser för %d valutor från KuCoin", len(contracts))
+    return contracts
+
+
 def find_dex_pair(symbol: str, force: bool = False) -> dict | None:
     """
-    Hittar rätt DEX-par för en KuCoin-symbol.
+    Hittar rätt DEX-par via KuCoins egen kontraktsadress.
 
-    Matchningen är den känsliga delen: samma ticker kan finnas på
-    dussintals kontrakt. Vi kräver exakt tickermatch OCH väljer det par
-    som har högst likviditet, eftersom det nästan alltid är det riktiga.
-    Resultatet sparas så att matchningen är stabil över tid.
+    Flödet:
+      1. Fråga KuCoin vilket kontrakt de listar för tokenen
+      2. Fråga DexScreener om par för EXAKT den adressen
+      3. Välj den pool som har högst likviditet BLAND DESSA
+
+    Steg 3 är säkert nu, eftersom alla kandidater är samma token —
+    vi väljer bara vilken pool som är djupast, inte vilken token som
+    är den riktiga.
+
+    Tokens utan kontraktsadress hos KuCoin (BTC, XRP, ADA på egen kedja)
+    får ingen match, vilket är korrekt: de har ingen meningsfull DEX-pool.
     """
     ensure_tables()
 
@@ -159,19 +215,24 @@ def find_dex_pair(symbol: str, force: bool = False) -> dict | None:
             )
             row = cur.fetchone()
         if row:
-            if row[4]:  # match_failed
+            if row[4]:
                 return None
             return {"chain_id": row[0], "pair_address": row[1],
                     "token_address": row[2], "dex_id": row[3]}
 
     base = _base_symbol(symbol)
-    data = _throttled_get(f"{BASE_URL}/search", {"q": base})
+    contracts = load_kucoin_contracts()
+    candidates = contracts.get(base, [])
 
     best = None
-    if data:
+    for c in candidates:
+        data = _throttled_get(f"{BASE_URL}/tokens/{c['address']}")
+        if not data:
+            continue
         for pair in data.get("pairs") or []:
+            # Dubbelkolla att basvalutan verkligen är vår adress
             bt = pair.get("baseToken") or {}
-            if (bt.get("symbol") or "").upper() != base:
+            if (bt.get("address") or "").lower() != c["address"].lower():
                 continue
             liq = ((pair.get("liquidity") or {}).get("usd")) or 0
             if liq < MIN_MATCH_LIQUIDITY_USD:
@@ -205,11 +266,12 @@ def find_dex_pair(symbol: str, force: bool = False) -> dict | None:
                 (symbol, best["chain_id"], best["pair_address"],
                  best["token_address"], best["dex_id"], best["liq"]),
             )
-            logger.info("Matchade %s -> %s på %s (likviditet %.0f USD)",
-                        symbol, best["dex_id"], best["chain_id"], best["liq"])
+            logger.info("Matchade %s -> %s på %s via KuCoin-kontrakt %s (likviditet %.0f USD)",
+                        symbol, best["dex_id"], best["chain_id"],
+                        best["token_address"][:12], best["liq"])
         else:
-            # Spara även misslyckade matchningar, annars söker vi om
-            # varje cykel för tokens som helt enkelt inte finns på DEX.
+            reason = ("ingen kontraktsadress hos KuCoin (nativ kedja)"
+                      if not candidates else "ingen DEX-pool över likviditetströskeln")
             cur.execute(
                 """
                 INSERT INTO token_dex_map (symbol, match_failed)
@@ -219,7 +281,7 @@ def find_dex_pair(symbol: str, force: bool = False) -> dict | None:
                 """,
                 (symbol,),
             )
-            logger.debug("Ingen DEX-match för %s", symbol)
+            logger.debug("Ingen DEX-match för %s: %s", symbol, reason)
 
     return best
 
@@ -389,6 +451,27 @@ def collect_for_symbols(symbols: list[str]) -> dict:
             failed += 1
     logger.info("On-chain features: %d hämtade, %d utan match", collected, failed)
     return {"collected": collected, "no_match": failed}
+
+
+def reset_mappings() -> dict:
+    """
+    Raderar alla sparade matchningar och features.
+
+    Behövs efter att matchningsmetoden ändrats: de gamla matchningarna
+    gjordes på ticker och pekade i flera fall på bluff-tokens med samma
+    symbol. All data som byggts på dem är oanvändbar.
+    """
+    with get_cursor() as cur:
+        cur.execute("SELECT COUNT(*) FROM token_dex_map")
+        maps = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM token_features")
+        feats = cur.fetchone()[0]
+        cur.execute("DELETE FROM token_features")
+        cur.execute("DELETE FROM token_dex_map")
+    global _kucoin_contracts
+    _kucoin_contracts = None
+    logger.warning("Nollställde %d matchningar och %d mätningar", maps, feats)
+    return {"mappings_deleted": maps, "features_deleted": feats}
 
 
 def coverage_stats() -> dict:

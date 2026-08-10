@@ -113,6 +113,14 @@ class Settings:
     # Hur ofta features hämtas (sekunder). Varje symbol = ett API-anrop.
     onchain_interval: int = int(os.getenv("ONCHAIN_INTERVAL_SECONDS", "600"))
 
+    # --- Arbitrage-observatör (observerar, handlar aldrig) ---
+    arbitrage_observer_enabled: bool = os.getenv(
+        "ARBITRAGE_OBSERVER_ENABLED", "true").lower() in ("1", "true", "yes")
+    arbitrage_interval: int = int(os.getenv("ARBITRAGE_INTERVAL_SECONDS", "300"))
+    # Affärsstorlek som kostnaderna räknas mot. Avgörande: gas är en fast
+    # kostnad, så samma spread är lönsam vid 5000 USD och katastrofal vid 200.
+    arbitrage_trade_size_usd: float = float(os.getenv("ARBITRAGE_TRADE_SIZE_USD", "200"))
+
     # Telegram-notiser (se notifier.py för hur du skapar en bot)
     telegram_bot_token: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
     telegram_chat_id: str = os.getenv("TELEGRAM_CHAT_ID", "")

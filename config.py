@@ -107,6 +107,12 @@ class Settings:
     # Hur ofta gammal data städas bort (sekunder). Standard: varje timme.
     cleanup_interval: int = int(os.getenv("CLEANUP_INTERVAL_SECONDS", "3600"))
 
+    # --- On-chain features via DexScreener (gratis, ingen nyckel) ---
+    onchain_enabled: bool = os.getenv(
+        "ONCHAIN_ENABLED", "true").lower() in ("1", "true", "yes")
+    # Hur ofta features hämtas (sekunder). Varje symbol = ett API-anrop.
+    onchain_interval: int = int(os.getenv("ONCHAIN_INTERVAL_SECONDS", "600"))
+
     # Telegram-notiser (se notifier.py för hur du skapar en bot)
     telegram_bot_token: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
     telegram_chat_id: str = os.getenv("TELEGRAM_CHAT_ID", "")

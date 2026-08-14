@@ -842,6 +842,26 @@ def bot_diagnostics(x_api_key: Optional[str] = Header(default=None)):
 # ---------------------------------------------------------------------------
 
 
+@app.get("/api/bots/stats", tags=["bots"])
+def bots_stats(x_api_key: Optional[str] = Header(default=None)):
+    """
+    Statistisk provning av alla bottar: ar resultatet en kant eller tur?
+
+    Fyra tester:
+      BOOTSTRAP        - 10 000 omspelningar av historien
+      KONCENTRATION    - bars vinsten av nagra fa affarer?
+      TIDSSTABILITET   - lonsam i bada halvorna av perioden?
+      MULTIPELTESTNING - med elva strategier forvantas nagra se bra ut
+                         av ren slump
+
+    Las 'verdict' per bot. Ett medelvarde ensamt kan inte skilja en kant
+    fran ett lotteri.
+    """
+    check_key(x_api_key)
+    import stats
+    return stats.analyze_all()
+
+
 @app.get("/api/bots/{bot_id}", tags=["bots"])
 def bot_detail(bot_id: int, x_api_key: Optional[str] = Header(default=None)):
     """Full statistik för en enskild bot, inklusive öppna positioner."""
@@ -1446,3 +1466,19 @@ def arbitrage_observations(
         )
         cols = [c.name for c in cur.description]
         return [dict(zip(cols, r)) for r in cur.fetchall()]
+
+
+@app.get("/api/bots/{bot_id}/stats", tags=["bots"])
+def bot_stats_single(bot_id: int, x_api_key: Optional[str] = Header(default=None)):
+    """Statistisk provning for en enskild bot."""
+    check_key(x_api_key)
+    import stats
+    from db import get_cursor
+    with get_cursor(commit=False) as cur:
+        cur.execute("SELECT id, name FROM bots WHERE id = %s", (bot_id,))
+        row = cur.fetchone()
+        cur.execute("SELECT COUNT(*) FROM bots")
+        n = cur.fetchone()[0]
+    if row is None:
+        raise HTTPException(status_code=404, detail="Bot finns inte")
+    return stats.analyze_bot(row[0], row[1], n)
